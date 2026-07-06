@@ -60,6 +60,27 @@
  * 80 turns/s motor = 10 turns/s output = 3600°/s — faster than any human. */
 #define VEL_NORM_TURNS  80.0f
 
+/* ---- Polarity (bring-up calibration; each is +1 or -1) ---------------------
+ * The motor/encoder wiring fixes two physical facts the firmware can't know:
+ * which way the encoder counts, and which way positive torque pushes. Correct
+ * them here without touching logic. Procedure (do at low MAX_NM, e.g. 0.5):
+ *   1. ENCODER_SIGN: turn the wheel right; if the in-game axis moves the wrong
+ *      way, flip it. This sets both the game axis AND the spring reference.
+ *   2. TORQUE_SIGN:  enable a centering spring; if the wheel is pushed AWAY
+ *      from center / runs away instead of returning, flip it.
+ * Get ENCODER_SIGN right first (step 1), then TORQUE_SIGN (step 2). */
+#ifndef ENCODER_SIGN
+#define ENCODER_SIGN  (+1)
+#endif
+#ifndef TORQUE_SIGN
+#define TORQUE_SIGN   (+1)
+#endif
+
+/* Sign-corrected encoder reads: apply ENCODER_SIGN at the single source so the
+ * game axis, spring, damper and inertia all share one consistent frame. */
+static inline float enc_position(void) { return ENCODER_SIGN * odrive_get_position(); }
+static inline float enc_velocity(void) { return ENCODER_SIGN * odrive_get_velocity(); }
+
 /* ============================================================ */
 /* Platform override: FFB tick clock                            */
 /* ============================================================ */
@@ -73,8 +94,9 @@ uint32_t ffb_get_tick_ms(void) {
 /* ============================================================ */
 
 void ffb_output_torque(int16_t torque) {
-    /* Map -32767..32767 to -MAX_NM..+MAX_Nm (motor side). */
-    float nm = (float)torque * (MAX_NM / 32767.0f);
+    /* Map -32767..32767 to -MAX_NM..+MAX_NM (motor side); TORQUE_SIGN corrects
+     * the physical rotation direction (see polarity notes above). */
+    float nm = (float)torque * (MAX_NM / 32767.0f) * TORQUE_SIGN;
     odrive_set_torque(ODRIVE_NODE_ID, nm);
 }
 
@@ -87,7 +109,7 @@ static float s_prev_vel = 0.0f;
 static uint32_t s_prev_vel_tick = 0;
 
 static int32_t read_encoder_position(void) {
-    float pos = odrive_get_position();  /* motor turns */
+    float pos = enc_position();  /* motor turns, sign-corrected */
     /* Normalize to -10000..10000 (PID condition metric). */
     int32_t v = (int32_t)(pos * (10000.0f / MOTOR_MAX_TURNS));
     if (v >  10000) v =  10000;
@@ -96,7 +118,7 @@ static int32_t read_encoder_position(void) {
 }
 
 static int32_t read_encoder_velocity(void) {
-    float vel = odrive_get_velocity();  /* motor turns/s */
+    float vel = enc_velocity();  /* motor turns/s, sign-corrected */
     /* Normalize to -10000..10000. */
     int32_t v = (int32_t)(vel * (10000.0f / VEL_NORM_TURNS));
     if (v >  10000) v =  10000;
@@ -108,7 +130,7 @@ static int32_t read_encoder_acceleration(void) {
     /* Estimate acceleration from velocity delta. The FFB engine calls this
      * at ~1 kHz, so dt ≈ 1 ms. We use the cached velocity; the Inertia
      * effect is rarely used and this rough estimate is good enough. */
-    float vel = odrive_get_velocity();
+    float vel = enc_velocity();  /* sign-corrected */
     uint32_t now = ffb_get_tick_ms();
     int32_t acc = 0;
     if (s_prev_vel_tick != 0 && now != s_prev_vel_tick) {
@@ -128,7 +150,7 @@ static int32_t read_encoder_acceleration(void) {
 
 /* Wheel axis position for the input report (int16_t, -32767..32767). */
 static int16_t read_wheel_axis(void) {
-    float pos = odrive_get_position();  /* motor turns */
+    float pos = enc_position();  /* motor turns, sign-corrected */
     int32_t v = (int32_t)(pos * (32767.0f / MOTOR_MAX_TURNS));
     if (v >  32767) v =  32767;
     if (v < -32767) v = -32767;
