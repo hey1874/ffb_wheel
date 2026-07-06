@@ -78,7 +78,7 @@ HID 描述符（源自 VNWheel, MIT 许可证）声明了一个 PID 1.0 Physical
 - 条件效果 (Spring/Damper/Friction/Inertia) 使用归一化到 -10000..10000 的轴度量 (匹配 PID 描述符)
 
 ### ODrive CAN (odrive_can.c)
-- `odrive_init()` — 发送 Set_Axis_State(8=CLOSED_LOOP) + Set_Controller_Mode(1=TORQUE, 1=DIRECT), 等待 500 ms 心跳
+- `odrive_init()` — 初始化 MCP2515 并发送首次 Set_Controller_Mode(1=TORQUE, 1=DIRECT) + Set_Axis_State(8=CLOSED_LOOP), 不阻塞; 主循环每秒重发直到心跳确认 CLOSED_LOOP(电机后上电也能自动进闭环)
 - `odrive_set_torque()` — 将 float Nm 打包为 CAN 0x0E 帧
 - `odrive_poll()` — 排空 RX 缓冲, 缓存 pos/vel (来自 0x09 广播), 追踪 CLOSED_LOOP (来自 0x01 心跳)
 - `odrive_get_position/velocity()` — 返回缓存的电机侧圈数和圈/秒
@@ -122,3 +122,34 @@ cmake -B build -G Ninja -DMAX_NM=3.0  # 更柔和的方向盘
 8. `BOARD_TUD_RHPORT` 不存在, 用 `0` 代替
 9. `mcp2515.h` 缺 `TXB0SIDL`/`RXB0SIDL` 寄存器定义 → 补上
 10. `usb_descriptors.c` 需 include `bsp/board_api.h` 才能用 `board_usb_get_serial` (static inline)
+
+### 2026-07 代码审查修复
+
+效果引擎 (ffb.c / ffb_types.h):
+
+11. `calc_condition` 负系数错误取反 → 弹簧两侧输出同向力, 方向盘会猛拉向一边; 按 PID 规范公式去掉负号
+12. 力度标度统一: 描述符 magnitude 范围是 ±10000, 引擎却按 ±32767 满量程 → 恒定力只有 30%; 周期效果的 magnitude 还在包络里被二次相乘 (≈9%)。现在全部效果在 ±10000 单位下计算, `ffb_calculate` 末端统一换算到 ±32767
+13. Set Envelope 的 attackTime/fadeTime 描述符是 32 位字段, 结构体误用 uint16 → fadeTime 永远读到 0; Set Periodic 的 period 同理改为 uint32
+14. 相位单位: 描述符是 0..35999 (0.01°), 代码原按 0..255 处理
+15. 无限时长: Windows 用 0xFFFF (Null 值) 表示无限, 原代码只认 0x7FFF → 无限效果 65 秒后消失。现在 0 和 ≥0x7FFF 都视为无限
+16. 周期 offset 范围 ±10000, 去掉遗留自 8 位描述符的 `offset*2`
+17. Effect Operation 的 loopCount 不再原地改写 duration (重复 Start 会翻倍), 改为独立的 totalDuration (uint32, 防溢出)
+18. 恒定力/斜坡力也应用包络 (PID 规范要求); 斜坡按循环迭代重新爬升
+19. 支持 Direction 字段: direction enable 且 direction≠0 时对力效果乘 sin(角度) (东=+X, 西=-X); direction=0 视为符号在 magnitude 里的游戏, 直通
+20. Set Condition 只接受 parameterBlockOffset==0, 防止 Y 轴条件块覆盖 X 轴弹簧参数
+21. GET_REPORT(Input) 现在会应答 PID State 报告 (部分驱动打开设备时查询)
+22. gain==0 不再被偷换成 255; Create Effect 后默认 gain=255
+
+安全性 (main.c / odrive_can.c):
+
+23. USB 拔线/挂起 (`tud_umount_cb`/`tud_suspend_cb`) 时停止所有效果并清零力矩 — 此前游戏崩溃后无限时长效果会永远输出力矩
+24. 心跳中 `axis_error` 非零时停发力矩指令
+25. ODrive v0.5.x 心跳的 current_state 是单字节 (后随 3 个 flag 字节), 原按 uint32 解析, flag 非零时会误判闭环状态
+26. `odrive_init` 不再阻塞 500ms 等心跳 (正值 USB 枚举窗口); 改为主循环 1 Hz 重发闭环请求, 电机晚上电也能进闭环
+
+CAN 驱动 (mcp2515.c):
+
+27. 启用 One-Shot 模式: 电机断电/无 ACK 时 TXREQ 不再永久挂起 (原来每帧阻塞 50ms, 主循环掉到 20Hz 拖死 USB); TX 等待缩短到 2ms
+28. 接收路径补上 RXB1: 原来开了 BUKT rollover 但从不读 RXB1/清 RX1IF, 首次 rollover 后 RXB1 永久占用
+
+⚠️ 待实机核实: `MAX_NM` 的量纲 — Set_Input_Torque 通常是减速箱**之前**的电机侧力矩, 4 Nm × 8:1 意味着盘端最高 ~32 Nm; 而如果手册的 "5 Nm 额定" 是输出侧, 电机侧额定仅 ~0.6 Nm。两种解读必有一错, 上机前先用低值 (如 `-DMAX_NM=0.5`) 验证。
