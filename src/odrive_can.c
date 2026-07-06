@@ -20,7 +20,6 @@
  */
 #include "odrive_can.h"
 #include "mcp2515.h"
-#include "pico/time.h"
 #include <string.h>
 
 /* ---- ODrive command IDs ---- */
@@ -112,36 +111,29 @@ static void send_u32_u32_cmd(uint8_t node_id, uint8_t cmd_id,
 
 /* ---- Public API ---- */
 
+void odrive_request_closed_loop(uint8_t node_id) {
+    /* 1. Set controller mode = TORQUE (1), input mode = DIRECT (1). */
+    send_u32_u32_cmd(node_id, ODRV_CMD_SET_CTRL_MODE,
+                     ODRV_CTRL_TORQUE, ODRV_INPUT_DIRECT);
+
+    /* 2. Put the axis into CLOSED_LOOP (state 8). */
+    send_u32_cmd(node_id, ODRV_CMD_SET_AXIS_STATE, ODRV_AXIS_CLOSED_LOOP);
+
+    /* 3. Zero torque so the motor doesn't run away before the FFB engine
+     *    takes over. */
+    odrive_set_torque(node_id, 0.0f);
+}
+
 bool odrive_init(uint8_t node_id) {
     if (!mcp2515_init()) {
         return false;
     }
 
-    /* 1. Put the axis into CLOSED_LOOP (state 8).
-     *    ODrive ignores the upper 16 bits; send uint32 requested_state. */
-    send_u32_cmd(node_id, ODRV_CMD_SET_AXIS_STATE, ODRV_AXIS_CLOSED_LOOP);
-
-    /* 2. Set controller mode = TORQUE (1), input mode = DIRECT (1). */
-    send_u32_u32_cmd(node_id, ODRV_CMD_SET_CTRL_MODE,
-                     ODRV_CTRL_TORQUE, ODRV_INPUT_DIRECT);
-
-    /* 3. Send zero torque so the motor doesn't run away before the FFB
-     *    engine takes over. */
-    odrive_set_torque(node_id, 0.0f);
-
-    /* 4. Poll for up to 500 ms waiting for a heartbeat showing CLOSED_LOOP.
-     *    The motor broadcasts heartbeats every ~100 ms by default. */
-    uint32_t start = to_ms_since_boot(get_absolute_time());
-    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
-        odrive_poll();
-        if (s_odrv.closed_loop) {
-            return true;
-        }
-    }
-
-    /* Even if no heartbeat arrived, return true if MCP2515 initialized —
-     * the motor may still come up later. The FFB engine will send torques
-     * and the heartbeat will eventually confirm. */
+    /* Fire the first arm request and return immediately. Blocking here for
+     * a heartbeat would stall tud_task() right in the USB enumeration
+     * window; the main loop re-sends the request until the heartbeat
+     * confirms CLOSED_LOOP. */
+    odrive_request_closed_loop(node_id);
     return true;
 }
 
@@ -167,10 +159,13 @@ void odrive_poll(void) {
 
         switch (cmd_id) {
             case ODRV_CMD_HEARTBEAT:
-                /* data[0..3] = axis_error, data[4..7] = current_state */
-                if (len >= 8) {
+                /* ODrive v0.5.x heartbeat: axis_error (u32), then
+                 * current_state as a SINGLE byte, followed by motor/encoder/
+                 * controller flag bytes. Reading state as u32 would misfire
+                 * whenever any flag byte is nonzero. */
+                if (len >= 5) {
                     s_odrv.axis_error = unpack_u32(data);
-                    s_odrv.axis_state = unpack_u32(data + 4);
+                    s_odrv.axis_state = data[4];
                     s_odrv.closed_loop = (s_odrv.axis_state == ODRV_AXIS_CLOSED_LOOP);
                 }
                 break;
@@ -200,4 +195,8 @@ float odrive_get_velocity(void) {
 
 bool odrive_is_closed_loop(void) {
     return s_odrv.closed_loop;
+}
+
+uint32_t odrive_axis_error(void) {
+    return s_odrv.axis_error;
 }

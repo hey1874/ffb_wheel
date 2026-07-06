@@ -30,8 +30,14 @@
 /* ============================================================ */
 
 /* Motor-side torque (Nm) corresponding to FFB engine's full-scale output
- * (±32767). The GIM6010-8 is rated 5 Nm motor-side; keep a small safety
- * margin. Override with -DMAX_NM=... at build time. */
+ * (±32767). Override with -DMAX_NM=... at build time.
+ *
+ * SAFETY — verify the unit before raising this. Set_Input_Torque (0x0E) is
+ * in the units of the motor's configured torque constant, normally BEFORE
+ * the 8:1 gearbox: the rim then sees up to 8 × MAX_NM (minus losses). If
+ * the "5 Nm rated" figure on the GIM6010-8 datasheet is the OUTPUT-side
+ * rating, the motor-side rating is only ~0.6 Nm and MAX_NM=4.0 overdrives
+ * it. Check the manual and measure current before trusting full scale. */
 #ifndef MAX_NM
 #define MAX_NM  4.0f
 #endif
@@ -129,6 +135,20 @@ static int16_t read_wheel_axis(void) {
 }
 
 /* ============================================================ */
+/* TinyUSB device callbacks — safety: never keep pushing after   */
+/* the host goes away (game crash, unplug, suspend).             */
+/* ============================================================ */
+
+void tud_umount_cb(void) {
+    ffb_stop_all();
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void)remote_wakeup_en;
+    ffb_stop_all();
+}
+
+/* ============================================================ */
 /* TinyUSB HID callbacks → FFB engine                           */
 /* ============================================================ */
 
@@ -176,6 +196,7 @@ int main(void) {
     uint32_t last_calc   = 0;
     uint32_t last_report = 0;
     uint32_t last_led    = 0;
+    uint32_t last_arm    = 0;
     bool     led_state   = false;
 
     while (1) {
@@ -186,16 +207,28 @@ int main(void) {
 
         uint32_t now = ffb_get_tick_ms();
 
+        /* Re-arm at 1 Hz until the heartbeat confirms CLOSED_LOOP, so a
+         * motor powered up (or power-cycled) after the Pico still arms. */
+        if (!odrive_is_closed_loop() && now - last_arm >= 1000) {
+            last_arm = now;
+            odrive_request_closed_loop(ODRIVE_NODE_ID);
+        }
+
         /* Effect engine at ~1 kHz. Reads encoder, sums effects, calls
          * ffb_output_torque(). */
         if (now != last_calc) {
             last_calc = now;
-            ffb_axis_metrics_t m = {
-                .position     = read_encoder_position(),
-                .velocity     = read_encoder_velocity(),
-                .acceleration = read_encoder_acceleration()
-            };
-            ffb_calculate(&m);
+            if (odrive_axis_error() != 0) {
+                /* Motor faulted: command zero torque, don't fight it. */
+                ffb_output_torque(0);
+            } else {
+                ffb_axis_metrics_t m = {
+                    .position     = read_encoder_position(),
+                    .velocity     = read_encoder_velocity(),
+                    .acceleration = read_encoder_acceleration()
+                };
+                ffb_calculate(&m);
+            }
         }
 
         /* Wheel input report at ~250 Hz (4 ms). Games poll the axis here. */
