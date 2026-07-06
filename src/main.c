@@ -24,6 +24,7 @@
 
 #include "ffb.h"
 #include "odrive_can.h"
+#include "pedals.h"
 
 /* ============================================================ */
 /* Configuration                                                */
@@ -189,6 +190,7 @@ int main(void) {
     board_init_after_tusb();
 
     ffb_init();
+    pedals_init();
 
     /* Initialize MCP2515 + ODrive (puts motor in CLOSED_LOOP + TORQUE mode). */
     odrive_init(ODRIVE_NODE_ID);
@@ -236,9 +238,16 @@ int main(void) {
             last_report = now;
             if (tud_hid_ready()) {
                 int16_t x = read_wheel_axis();
+                /* Pedals → Y (throttle), Z (brake), Rx (clutch). Guards are
+                 * compile-time constants, so this is safe for any PEDAL_COUNT. */
+                int16_t ped[PEDAL_COUNT] = {0};
+                pedals_read(ped);
+                int16_t thr = (PEDAL_COUNT > 0) ? ped[0] : 0;
+                int16_t brk = (PEDAL_COUNT > 1) ? ped[1] : 0;
+                int16_t clu = (PEDAL_COUNT > 2) ? ped[2] : 0;
                 uint8_t buf[sizeof(ffb_wheel_report_t)];
                 ffb_build_wheel_report(buf, sizeof(buf), 0,
-                                        x, 0, 0, 0, 0, 0);
+                                        x, thr, brk, clu, 0, 0);
                 tud_hid_report(FFB_RID_WHEEL, buf, sizeof(buf));
             }
         }

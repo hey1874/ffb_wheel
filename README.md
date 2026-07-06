@@ -59,7 +59,9 @@ ffb_wheel/
     ├── mcp2515.h               # MCP2515 SPI-CAN 驱动头文件
     ├── mcp2515.c               # MCP2515 实现 (轮询模式)
     ├── odrive_can.h            # ODrive CAN 协议 API
-    └── odrive_can.c            # ODrive 实现 (力矩 + 编码器轮询)
+    ├── odrive_can.c            # ODrive 实现 (力矩 + 编码器轮询)
+    ├── pedals.h                # 模拟踏板接口 (油门/刹车/离合)
+    └── pedals.c                # 片上 ADC 读踏板, 过采样+低通+自动量程
 ```
 
 ## 工作原理
@@ -93,6 +95,23 @@ cmake -B build -G Ninja -DMAX_NM=3.0  # 更柔和的方向盘
 - FFB 度量: 电机圈数 → -10000..10000 (用于 Spring/Damper/Friction/Inertia)
 - 方向盘报告: 电机圈数 → -32767..32767 (int16_t, 供游戏读取)
 - 可配置: `-DWHEEL_MAX_TURNS=2.5` 实现 ±900° 方向盘
+
+## 踏板 (油门 / 刹车 / 离合)
+
+HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP2040/RP2350
+片上 12-bit ADC 读三路模拟踏板, 填入 Y (油门)、Z (刹车)、Rx (离合):
+
+- 默认引脚: **ADC0/1/2 = GP26/GP27/GP28**
+- 每路做 8 次过采样 + 指数低通降噪, 并做 OpenFFBoard 式**自动量程** —— 第一次踩满
+  全行程后即完成标定, 释放端映射到轴最小值
+- 编译期可调: `-DPEDAL_COUNT=2` (只用两路)、`-DPEDAL_INVERT_MASK=0x2` (第 2 路反向,
+  用于踩下时电压下降的接线)
+
+> ⚠️ **接线安全 — ADC 脚不耐 5V** (RP2040 完全不耐; RP2350 的 5V 容忍**不含**
+> GP26-29 这几个 ADC 脚)。
+> - **被动电位器踏板**: 电位器两端接 **3V3(OUT)** 和 GND, 滑臂进 ADC 脚 —— **不要接 5V**。
+> - **有源 0-5V 传感器**: 分压到 0-3.3V, 或外接 ADS1115 (I²C), 切勿把 5V 直连 ADC 脚。
+> - 不接的踏板务必同时调低 `PEDAL_COUNT`; 悬空的 ADC 脚会因噪声被自动量程误标定。
 
 ## 游戏兼容性
 使用 OpenFFBoard 的 VID/PID (0x1209/0xFFB0)，因此按 ID 注册设备的游戏 (Dirt, EA WRC) 无需编辑 XML 即可识别本方向盘。兼容任何 DirectInput FFB 游戏: Assetto Corsa, iRacing, rFactor 2, BeamNG, Forza 等。
