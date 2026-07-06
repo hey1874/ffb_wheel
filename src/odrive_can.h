@@ -53,4 +53,9 @@ bool odrive_is_closed_loop(void);
  * caller should stop commanding torque. */
 uint32_t odrive_axis_error(void);
 
+/* True once at least one Get_Encoder_Estimates frame has been received, i.e.
+ * odrive_get_position()/velocity() reflect real data rather than the initial
+ * zero. Used to defer center capture until the encoder is live. */
+bool odrive_has_encoder(void);
+
 #endif /* ODRIVE_CAN_H */

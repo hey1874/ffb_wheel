@@ -44,12 +44,14 @@ static struct {
     uint32_t axis_state;     /* from heartbeat */
     uint32_t axis_error;     /* from heartbeat */
     bool     closed_loop;
+    bool     encoder_valid;  /* at least one Get_Encoder_Estimates received */
 } s_odrv = {
     .position = 0.0f,
     .velocity = 0.0f,
     .axis_state = 0,
     .axis_error = 0,
     .closed_loop = false,
+    .encoder_valid = false,
 };
 
 /* ---- Helpers ---- */
@@ -175,6 +177,7 @@ void odrive_poll(void) {
                 if (len >= 8) {
                     s_odrv.position = unpack_f32(data);
                     s_odrv.velocity = unpack_f32(data + 4);
+                    s_odrv.encoder_valid = true;
                 }
                 break;
 
@@ -199,4 +202,8 @@ bool odrive_is_closed_loop(void) {
 
 uint32_t odrive_axis_error(void) {
     return s_odrv.axis_error;
+}
+
+bool odrive_has_encoder(void) {
+    return s_odrv.encoder_valid;
 }

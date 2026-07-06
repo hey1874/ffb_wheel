@@ -76,9 +76,34 @@
 #define TORQUE_SIGN   (+1)
 #endif
 
-/* Sign-corrected encoder reads: apply ENCODER_SIGN at the single source so the
- * game axis, spring, damper and inertia all share one consistent frame. */
-static inline float enc_position(void) { return ENCODER_SIGN * odrive_get_position(); }
+/* Capture the wheel's power-on position as center once the encoder goes live
+ * (default). Center the wheel before/at power-on, or call wheel_recenter()
+ * (e.g. from a button) when it is physically centered. Set 0 to fall back to
+ * the ODrive encoder's own zero as center. */
+#ifndef WHEEL_CENTER_AT_BOOT
+#define WHEEL_CENTER_AT_BOOT  1
+#endif
+
+/* Soft zero: raw motor turns treated as wheel center. Subtracted from every
+ * position read so "center" is a definable reference, not the arbitrary
+ * ODrive/encoder zero (which for an absolute encoder need not be the wheel's
+ * mechanical center, and for an incremental one is just the power-on spot). */
+static float s_center_offset = 0.0f;
+static bool  s_centered      = false;
+
+/* Redefine the current wheel position as center. External linkage so a future
+ * button handler can rebind it; also called once at startup. */
+void wheel_recenter(void) {
+    s_center_offset = odrive_get_position();
+    s_centered = true;
+}
+
+/* Sign-corrected, center-referenced position: apply the center offset and
+ * ENCODER_SIGN at one source so the game axis, spring, damper and inertia all
+ * share one consistent frame. Velocity is a rate, unaffected by the offset. */
+static inline float enc_position(void) {
+    return ENCODER_SIGN * (odrive_get_position() - s_center_offset);
+}
 static inline float enc_velocity(void) { return ENCODER_SIGN * odrive_get_velocity(); }
 
 /* ============================================================ */
@@ -236,6 +261,12 @@ int main(void) {
         if (!odrive_is_closed_loop() && now - last_arm >= 1000) {
             last_arm = now;
             odrive_request_closed_loop(ODRIVE_NODE_ID);
+        }
+
+        /* Capture center once the encoder is live — deterministic power-on
+         * center that also survives an absolute encoder's nonzero boot value. */
+        if (WHEEL_CENTER_AT_BOOT && !s_centered && odrive_has_encoder()) {
+            wheel_recenter();
         }
 
         /* Effect engine at ~1 kHz. Reads encoder, sums effects, calls
