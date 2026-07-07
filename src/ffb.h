@@ -27,6 +27,10 @@ typedef struct {
 /* ---- Lifecycle ---- */
 void ffb_init(void);
 
+/* Safety stop: halt all playing effects and drive torque to zero. Call on
+ * USB unmount/suspend or motor fault so the wheel never keeps pushing. */
+void ffb_stop_all(void);
+
 /* ---- USB callback entry points (call from tud_hid_set/get_report_cb) ---- */
 /* buffer has the reportId byte already stripped by TinyUSB. */
 void     ffb_on_set_report(uint8_t report_id, uint8_t report_type,

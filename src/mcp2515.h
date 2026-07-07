@@ -72,11 +72,20 @@
 #define MCP_RXB0SIDL     0x62
 #define MCP_RXB0DLC      0x65
 #define MCP_RXB0D0       0x66
+#define MCP_RXB1CTRL     0x70
+#define MCP_RXB1SIDH     0x71
+#define MCP_RXB1SIDL     0x72
+#define MCP_RXB1DLC      0x75
+#define MCP_RXB1D0       0x76
 
 /* CANCTRL mode bits */
 #define MCP_MODE_NORMAL    0x00
 #define MCP_MODE_LOOPBACK  0x40
 #define MCP_MODE_CONFIG    0x80
+/* CANCTRL One-Shot Mode: no automatic retransmission. Keeps mcp2515_send()
+ * from blocking forever when the bus has no other node to ACK (motor off) —
+ * a lost torque frame is replaced 1 ms later anyway. */
+#define MCP_OSM            0x08
 
 /* Initialize SPI + MCP2515, set baud rate, enter NORMAL mode.
  * Returns true if self-test (read CANSTAT) succeeds. */

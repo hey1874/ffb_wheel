@@ -27,6 +27,7 @@ add_executable(ffb_wheel
     src/usb_descriptors.c
     src/mcp2515.c      # MCP2515 SPI-CAN driver
     src/odrive_can.c   # ODrive CAN protocol (torque + encoder polling)
+    src/pedals.c       # Analog pedals (throttle/brake/clutch) via on-chip ADC
 )
 
 target_include_directories(ffb_wheel PRIVATE src)
@@ -42,6 +43,7 @@ target_link_libraries(ffb_wheel
     hardware_timer
     hardware_spi
     hardware_gpio
+    hardware_adc      # on-chip ADC for analog pedals (pedals.c)
 )
 
 # Emit .uf2, .hex, .disasm

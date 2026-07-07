@@ -24,14 +24,21 @@
 
 #include "ffb.h"
 #include "odrive_can.h"
+#include "pedals.h"
 
 /* ============================================================ */
 /* Configuration                                                */
 /* ============================================================ */
 
 /* Motor-side torque (Nm) corresponding to FFB engine's full-scale output
- * (±32767). The GIM6010-8 is rated 5 Nm motor-side; keep a small safety
- * margin. Override with -DMAX_NM=... at build time. */
+ * (±32767). Override with -DMAX_NM=... at build time.
+ *
+ * SAFETY — verify the unit before raising this. Set_Input_Torque (0x0E) is
+ * in the units of the motor's configured torque constant, normally BEFORE
+ * the 8:1 gearbox: the rim then sees up to 8 × MAX_NM (minus losses). If
+ * the "5 Nm rated" figure on the GIM6010-8 datasheet is the OUTPUT-side
+ * rating, the motor-side rating is only ~0.6 Nm and MAX_NM=4.0 overdrives
+ * it. Check the manual and measure current before trusting full scale. */
 #ifndef MAX_NM
 #define MAX_NM  4.0f
 #endif
@@ -53,6 +60,52 @@
  * 80 turns/s motor = 10 turns/s output = 3600°/s — faster than any human. */
 #define VEL_NORM_TURNS  80.0f
 
+/* ---- Polarity (bring-up calibration; each is +1 or -1) ---------------------
+ * The motor/encoder wiring fixes two physical facts the firmware can't know:
+ * which way the encoder counts, and which way positive torque pushes. Correct
+ * them here without touching logic. Procedure (do at low MAX_NM, e.g. 0.5):
+ *   1. ENCODER_SIGN: turn the wheel right; if the in-game axis moves the wrong
+ *      way, flip it. This sets both the game axis AND the spring reference.
+ *   2. TORQUE_SIGN:  enable a centering spring; if the wheel is pushed AWAY
+ *      from center / runs away instead of returning, flip it.
+ * Get ENCODER_SIGN right first (step 1), then TORQUE_SIGN (step 2). */
+#ifndef ENCODER_SIGN
+#define ENCODER_SIGN  (+1)
+#endif
+#ifndef TORQUE_SIGN
+#define TORQUE_SIGN   (+1)
+#endif
+
+/* Capture the wheel's power-on position as center once the encoder goes live
+ * (default). Center the wheel before/at power-on, or call wheel_recenter()
+ * (e.g. from a button) when it is physically centered. Set 0 to fall back to
+ * the ODrive encoder's own zero as center. */
+#ifndef WHEEL_CENTER_AT_BOOT
+#define WHEEL_CENTER_AT_BOOT  1
+#endif
+
+/* Soft zero: raw motor turns treated as wheel center. Subtracted from every
+ * position read so "center" is a definable reference, not the arbitrary
+ * ODrive/encoder zero (which for an absolute encoder need not be the wheel's
+ * mechanical center, and for an incremental one is just the power-on spot). */
+static float s_center_offset = 0.0f;
+static bool  s_centered      = false;
+
+/* Redefine the current wheel position as center. External linkage so a future
+ * button handler can rebind it; also called once at startup. */
+void wheel_recenter(void) {
+    s_center_offset = odrive_get_position();
+    s_centered = true;
+}
+
+/* Sign-corrected, center-referenced position: apply the center offset and
+ * ENCODER_SIGN at one source so the game axis, spring, damper and inertia all
+ * share one consistent frame. Velocity is a rate, unaffected by the offset. */
+static inline float enc_position(void) {
+    return ENCODER_SIGN * (odrive_get_position() - s_center_offset);
+}
+static inline float enc_velocity(void) { return ENCODER_SIGN * odrive_get_velocity(); }
+
 /* ============================================================ */
 /* Platform override: FFB tick clock                            */
 /* ============================================================ */
@@ -66,8 +119,9 @@ uint32_t ffb_get_tick_ms(void) {
 /* ============================================================ */
 
 void ffb_output_torque(int16_t torque) {
-    /* Map -32767..32767 to -MAX_NM..+MAX_Nm (motor side). */
-    float nm = (float)torque * (MAX_NM / 32767.0f);
+    /* Map -32767..32767 to -MAX_NM..+MAX_NM (motor side); TORQUE_SIGN corrects
+     * the physical rotation direction (see polarity notes above). */
+    float nm = (float)torque * (MAX_NM / 32767.0f) * TORQUE_SIGN;
     odrive_set_torque(ODRIVE_NODE_ID, nm);
 }
 
@@ -80,7 +134,7 @@ static float s_prev_vel = 0.0f;
 static uint32_t s_prev_vel_tick = 0;
 
 static int32_t read_encoder_position(void) {
-    float pos = odrive_get_position();  /* motor turns */
+    float pos = enc_position();  /* motor turns, sign-corrected */
     /* Normalize to -10000..10000 (PID condition metric). */
     int32_t v = (int32_t)(pos * (10000.0f / MOTOR_MAX_TURNS));
     if (v >  10000) v =  10000;
@@ -89,7 +143,7 @@ static int32_t read_encoder_position(void) {
 }
 
 static int32_t read_encoder_velocity(void) {
-    float vel = odrive_get_velocity();  /* motor turns/s */
+    float vel = enc_velocity();  /* motor turns/s, sign-corrected */
     /* Normalize to -10000..10000. */
     int32_t v = (int32_t)(vel * (10000.0f / VEL_NORM_TURNS));
     if (v >  10000) v =  10000;
@@ -101,7 +155,7 @@ static int32_t read_encoder_acceleration(void) {
     /* Estimate acceleration from velocity delta. The FFB engine calls this
      * at ~1 kHz, so dt ≈ 1 ms. We use the cached velocity; the Inertia
      * effect is rarely used and this rough estimate is good enough. */
-    float vel = odrive_get_velocity();
+    float vel = enc_velocity();  /* sign-corrected */
     uint32_t now = ffb_get_tick_ms();
     int32_t acc = 0;
     if (s_prev_vel_tick != 0 && now != s_prev_vel_tick) {
@@ -121,11 +175,25 @@ static int32_t read_encoder_acceleration(void) {
 
 /* Wheel axis position for the input report (int16_t, -32767..32767). */
 static int16_t read_wheel_axis(void) {
-    float pos = odrive_get_position();  /* motor turns */
+    float pos = enc_position();  /* motor turns, sign-corrected */
     int32_t v = (int32_t)(pos * (32767.0f / MOTOR_MAX_TURNS));
     if (v >  32767) v =  32767;
     if (v < -32767) v = -32767;
     return (int16_t)v;
+}
+
+/* ============================================================ */
+/* TinyUSB device callbacks — safety: never keep pushing after   */
+/* the host goes away (game crash, unplug, suspend).             */
+/* ============================================================ */
+
+void tud_umount_cb(void) {
+    ffb_stop_all();
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void)remote_wakeup_en;
+    ffb_stop_all();
 }
 
 /* ============================================================ */
@@ -169,6 +237,7 @@ int main(void) {
     board_init_after_tusb();
 
     ffb_init();
+    pedals_init();
 
     /* Initialize MCP2515 + ODrive (puts motor in CLOSED_LOOP + TORQUE mode). */
     odrive_init(ODRIVE_NODE_ID);
@@ -176,6 +245,7 @@ int main(void) {
     uint32_t last_calc   = 0;
     uint32_t last_report = 0;
     uint32_t last_led    = 0;
+    uint32_t last_arm    = 0;
     bool     led_state   = false;
 
     while (1) {
@@ -186,16 +256,34 @@ int main(void) {
 
         uint32_t now = ffb_get_tick_ms();
 
+        /* Re-arm at 1 Hz until the heartbeat confirms CLOSED_LOOP, so a
+         * motor powered up (or power-cycled) after the Pico still arms. */
+        if (!odrive_is_closed_loop() && now - last_arm >= 1000) {
+            last_arm = now;
+            odrive_request_closed_loop(ODRIVE_NODE_ID);
+        }
+
+        /* Capture center once the encoder is live — deterministic power-on
+         * center that also survives an absolute encoder's nonzero boot value. */
+        if (WHEEL_CENTER_AT_BOOT && !s_centered && odrive_has_encoder()) {
+            wheel_recenter();
+        }
+
         /* Effect engine at ~1 kHz. Reads encoder, sums effects, calls
          * ffb_output_torque(). */
         if (now != last_calc) {
             last_calc = now;
-            ffb_axis_metrics_t m = {
-                .position     = read_encoder_position(),
-                .velocity     = read_encoder_velocity(),
-                .acceleration = read_encoder_acceleration()
-            };
-            ffb_calculate(&m);
+            if (odrive_axis_error() != 0) {
+                /* Motor faulted: command zero torque, don't fight it. */
+                ffb_output_torque(0);
+            } else {
+                ffb_axis_metrics_t m = {
+                    .position     = read_encoder_position(),
+                    .velocity     = read_encoder_velocity(),
+                    .acceleration = read_encoder_acceleration()
+                };
+                ffb_calculate(&m);
+            }
         }
 
         /* Wheel input report at ~250 Hz (4 ms). Games poll the axis here. */
@@ -203,9 +291,16 @@ int main(void) {
             last_report = now;
             if (tud_hid_ready()) {
                 int16_t x = read_wheel_axis();
+                /* Pedals → Y (throttle), Z (brake), Rx (clutch). Guards are
+                 * compile-time constants, so this is safe for any PEDAL_COUNT. */
+                int16_t ped[PEDAL_COUNT] = {0};
+                pedals_read(ped);
+                int16_t thr = (PEDAL_COUNT > 0) ? ped[0] : 0;
+                int16_t brk = (PEDAL_COUNT > 1) ? ped[1] : 0;
+                int16_t clu = (PEDAL_COUNT > 2) ? ped[2] : 0;
                 uint8_t buf[sizeof(ffb_wheel_report_t)];
                 ffb_build_wheel_report(buf, sizeof(buf), 0,
-                                        x, 0, 0, 0, 0, 0);
+                                        x, thr, brk, clu, 0, 0);
                 tud_hid_report(FFB_RID_WHEEL, buf, sizeof(buf));
             }
         }

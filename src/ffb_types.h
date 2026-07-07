@@ -58,7 +58,13 @@
 
 /* ---- Limits ---- */
 #define FFB_MAX_EFFECTS          40   /* descriptor declares Logical Maximum 0x28 */
-#define FFB_DURATION_INFINITE    0x7FFF
+/* Duration logical range is 0..32767 ms. Hosts signal "infinite" with the USB
+ * PID Null value (out of range); Windows sends 0xFFFF. Treat 0 and anything
+ * >= 0x7FFF as infinite. */
+#define FFB_DURATION_INFINITE    0xFFFF
+#define FFB_DURATION_IS_INF(d)   ((d) == 0 || (d) >= 0x7FFF)
+/* Total playback time in ms once loopCount is applied (uint32). */
+#define FFB_TOTALDUR_INFINITE    0xFFFFFFFFu
 
 /* ---- Effect state flags ---- */
 #define FFB_STATE_FREE           0x00
@@ -115,12 +121,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  directionY;
 } ffb_set_effect_t;
 
+/* Descriptor declares attack/fade time as 32-bit fields (Report Size 32). */
 typedef struct __attribute__((packed)) {
     uint8_t  effectBlockIndex;
     uint16_t attackLevel;
     uint16_t fadeLevel;
-    uint16_t attackTime;
-    uint16_t fadeTime;
+    uint32_t attackTime;
+    uint32_t fadeTime;
 } ffb_set_envelope_t;
 
 typedef struct __attribute__((packed)) {
@@ -134,12 +141,14 @@ typedef struct __attribute__((packed)) {
     uint16_t deadBand;
 } ffb_set_condition_t;
 
+/* magnitude 0..10000; offset -10000..10000; phase 0..35999 (0.01 deg);
+ * period is a 32-bit field in the descriptor (Report Size 32), unit ms. */
 typedef struct __attribute__((packed)) {
     uint8_t  effectBlockIndex;
     uint16_t magnitude;
     int16_t  offset;
     uint16_t phase;
-    uint16_t period;
+    uint32_t period;
 } ffb_set_periodic_t;
 
 typedef struct __attribute__((packed)) {
@@ -193,15 +202,18 @@ typedef struct __attribute__((packed)) {
 typedef struct {
     volatile uint8_t state;     /* FFB_STATE_* */
     uint8_t  effectType;
-    int16_t  offset;            /* periodic offset / condition cpOffset */
+    int16_t  offset;            /* periodic offset (-10000..10000) */
     uint8_t  gain;
+    uint8_t  enableAxis;        /* bit0=X, bit1=Y, bit2=direction enable */
+    uint8_t  directionX;        /* 0..255 = 0..360 deg, clockwise from north */
     int16_t  attackLevel, fadeLevel;
-    int16_t  magnitude;         /* constant / periodic magnitude */
+    int16_t  magnitude;         /* constant (signed) / periodic (0..10000) */
     int16_t  startMagnitude, endMagnitude; /* ramp */
-    uint16_t period;
-    uint16_t phase;
-    uint16_t duration;
-    uint16_t attackTime, fadeTime;
+    uint32_t period;            /* ms */
+    uint16_t phase;             /* 0..35999, 0.01 deg */
+    uint16_t duration;          /* ms, single iteration */
+    uint32_t totalDuration;     /* ms incl. loopCount; FFB_TOTALDUR_INFINITE */
+    uint32_t attackTime, fadeTime;
     uint32_t startTime;         /* ms, from to_ms_since_boot */
     uint32_t elapsedTime;       /* ms since start */
     /* condition params */

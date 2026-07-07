@@ -68,6 +68,11 @@ static uint8_t get_next_free_effect(void) {
     return id;
 }
 
+void ffb_stop_all(void) {
+    stop_all_effects();
+    ffb_output_torque(0);
+}
+
 static void start_effect(uint8_t id) {
     if (id > FFB_MAX_EFFECTS) return;
     g_effects[id].state = FFB_STATE_PLAYING | FFB_STATE_ALLOCATED;
@@ -84,9 +89,14 @@ static void handle_set_effect(const ffb_set_effect_t *r) {
     ffb_effect_t *e = &g_effects[r->effectBlockIndex];
     e->effectType  = r->effectType;
     e->duration    = r->duration;
-    e->gain        = r->gain ? r->gain : 255;
-    /* directionX/Y, enableAxis, samplePeriod, triggerRepeatInterval stored
-     * implicitly; single-axis wheel applies everything on X. */
+    e->gain        = r->gain;
+    e->enableAxis  = r->enableAxis;
+    e->directionX  = r->directionX;
+    /* Games may re-send Set Effect while the effect is playing; keep the
+     * running total in sync (loopCount is re-applied on the next Start op). */
+    e->totalDuration = FFB_DURATION_IS_INF(r->duration)
+                     ? FFB_TOTALDUR_INFINITE : r->duration;
+    /* samplePeriod / triggerRepeatInterval unused on this device. */
 }
 
 static void handle_set_envelope(const ffb_set_envelope_t *r) {
@@ -100,6 +110,9 @@ static void handle_set_envelope(const ffb_set_envelope_t *r) {
 
 static void handle_set_condition(const ffb_set_condition_t *r) {
     if (r->effectBlockIndex > FFB_MAX_EFFECTS) return;
+    /* Low nibble = Parameter Block Offset. This wheel has one FFB axis (X,
+     * block 0); a Y-axis condition block (offset 1) must not clobber it. */
+    if ((r->parameterBlockOffset & 0x0F) != 0) return;
     ffb_effect_t *e = &g_effects[r->effectBlockIndex];
     e->cpOffset              = r->cpOffset;
     e->positiveCoefficient  = r->positiveCoefficient;
@@ -129,18 +142,26 @@ static void handle_set_ramp(const ffb_set_ramp_t *r) {
     g_effects[r->effectBlockIndex].endMagnitude   = r->endMagnitude;
 }
 
+/* Total playback time for a Start op: duration × loopCount, without
+ * mutating the stored per-iteration duration (Start may repeat). */
+static uint32_t total_duration_for(const ffb_effect_t *e, uint8_t loopCount) {
+    if (FFB_DURATION_IS_INF(e->duration) || loopCount == 0xFF)
+        return FFB_TOTALDUR_INFINITE;
+    uint8_t loops = loopCount ? loopCount : 1;
+    return (uint32_t)e->duration * loops;
+}
+
 static void handle_effect_op(const ffb_effect_op_t *r) {
     if (r->effectBlockIndex > FFB_MAX_EFFECTS) return;
     ffb_effect_t *e = &g_effects[r->effectBlockIndex];
     switch (r->operation) {
         case 1: /* Start */
-            if (r->loopCount > 1 && e->duration != FFB_DURATION_INFINITE)
-                e->duration *= r->loopCount;
-            if (r->loopCount == 0xFF) e->duration = FFB_DURATION_INFINITE;
+            e->totalDuration = total_duration_for(e, r->loopCount);
             start_effect(r->effectBlockIndex);
             break;
         case 2: /* StartSolo */
             stop_all_effects();
+            e->totalDuration = total_duration_for(e, r->loopCount);
             start_effect(r->effectBlockIndex);
             break;
         case 3: /* Stop */
@@ -177,8 +198,10 @@ static void handle_create_effect(const ffb_create_effect_t *r) {
     g_block_load.effectBlockIndex = get_next_free_effect();
     g_block_load.loadStatus = g_block_load.effectBlockIndex ? 1 : 2;
     if (g_block_load.effectBlockIndex) {
-        memset(&g_effects[g_block_load.effectBlockIndex], 0, sizeof(ffb_effect_t));
-        g_effects[g_block_load.effectBlockIndex].state = FFB_STATE_ALLOCATED;
+        ffb_effect_t *e = &g_effects[g_block_load.effectBlockIndex];
+        memset(e, 0, sizeof(ffb_effect_t));
+        e->state = FFB_STATE_ALLOCATED;
+        e->gain  = 255;   /* full gain until Set Effect says otherwise */
     }
 }
 
@@ -217,7 +240,18 @@ void ffb_on_set_report(uint8_t report_id, uint8_t report_type,
 
 uint16_t ffb_on_get_report(uint8_t report_id, uint8_t report_type,
                            uint8_t *buffer, uint16_t reqlen) {
-    (void)report_type;
+    if (report_type == FFB_REPORT_TYPE_INPUT) {
+        /* Some hosts issue GET_REPORT(Input) for the PID state on open. */
+        if (report_id == FFB_RID_PID_STATE &&
+            reqlen >= sizeof(ffb_pid_state_report_t)) {
+            g_pid_state.status = FFB_STATUS_POWER
+                | (g_device_paused     ? FFB_STATUS_PAUSED    : 0)
+                | (g_actuators_enabled ? FFB_STATUS_ACTUATORS : 0);
+            memcpy(buffer, &g_pid_state, sizeof(ffb_pid_state_report_t));
+            return sizeof(ffb_pid_state_report_t);
+        }
+        return 0;
+    }
     switch (report_id) {
         case FFB_RID_BLOCK_LOAD: {
             if (reqlen < sizeof(ffb_block_load_t)) return 0;
@@ -247,99 +281,134 @@ static int32_t clip32(int32_t v, int32_t lo, int32_t hi) {
     return v;
 }
 
-/* Envelope scaler (0..32767) applied to periodic forces. */
-static int32_t apply_envelope(const ffb_effect_t *e, int32_t force) {
-    int32_t mag   = (int32_t)e->magnitude * e->gain / 255;
-    int32_t atkL  = (int32_t)e->attackLevel * e->gain / 255;
-    int32_t fadeL = (int32_t)e->fadeLevel   * e->gain / 255;
-    int32_t scaler = mag;
+/* All effect math works in the descriptor's native -10000..10000 units;
+ * ffb_calculate() converts the summed force to ±32767 at the very end. */
+#define FFB_UNIT_MAX  10000
+
+/* Current envelope amplitude (0..10000). `sustain` is the effect's nominal
+ * amplitude; attack ramps attackLevel→sustain, fade ramps sustain→fadeLevel
+ * over the last fadeTime ms of the total playback time. */
+static int32_t envelope_level(const ffb_effect_t *e, int32_t sustain) {
     uint32_t el = e->elapsedTime;
+    /* 64-bit intermediates: attack/fade times are 32-bit ms values. */
     if (e->attackTime && el < e->attackTime) {
-        scaler = atkL + (mag - atkL) * (int32_t)el / (int32_t)e->attackTime;
-    } else if (e->fadeTime && e->duration != FFB_DURATION_INFINITE &&
-               el > (uint32_t)(e->duration - e->fadeTime)) {
-        uint32_t remaining = e->duration - el;
-        scaler = fadeL + (mag - fadeL) * (int32_t)remaining / (int32_t)e->fadeTime;
+        return e->attackLevel + (int32_t)
+               ((int64_t)(sustain - e->attackLevel) * el / e->attackTime);
     }
-    return force * scaler / 32767;
+    if (e->fadeTime && e->totalDuration != FFB_TOTALDUR_INFINITE &&
+        e->totalDuration > e->fadeTime &&
+        el > e->totalDuration - e->fadeTime) {
+        uint32_t remaining = e->totalDuration - el;
+        return e->fadeLevel + (int32_t)
+               ((int64_t)(sustain - e->fadeLevel) * remaining / e->fadeTime);
+    }
+    return sustain;
+}
+
+/* Envelope for signed force values (constant/ramp): modulate the magnitude,
+ * keep the sign. */
+static int32_t envelope_signed(const ffb_effect_t *e, int32_t value) {
+    int32_t lvl = envelope_level(e, value < 0 ? -value : value);
+    return (value < 0) ? -lvl : lvl;
 }
 
 static int32_t calc_constant(const ffb_effect_t *e) {
-    return (int32_t)e->magnitude * e->gain / 255;
+    return envelope_signed(e, e->magnitude) * e->gain / 255;
 }
 
 static int32_t calc_ramp(const ffb_effect_t *e) {
-    if (e->duration == 0) return e->startMagnitude;
-    return e->startMagnitude +
-           (int32_t)e->elapsedTime * (e->endMagnitude - e->startMagnitude) / (int32_t)e->duration;
+    int32_t val = e->startMagnitude;
+    if (!FFB_DURATION_IS_INF(e->duration)) {
+        /* Modulo so looped playback ramps again each iteration; 64-bit so
+         * elapsed × Δmagnitude can't overflow. */
+        uint32_t t = e->elapsedTime % e->duration;
+        val += (int32_t)((int64_t)t *
+               (e->endMagnitude - e->startMagnitude) / (int32_t)e->duration);
+    }
+    return envelope_signed(e, val) * e->gain / 255;
+}
+
+/* Waveform time within one period, with the phase offset applied.
+ * Phase is 0..35999 in units of 0.01 degrees (descriptor unit exp -2). */
+static uint32_t periodic_time(const ffb_effect_t *e) {
+    uint32_t phase_t = (uint32_t)((uint64_t)e->phase * e->period / 36000u);
+    return (e->elapsedTime + phase_t) % e->period;
 }
 
 static int32_t calc_square(const ffb_effect_t *e) {
     if (e->period == 0) return 0;
-    uint32_t phase_t = (uint32_t)e->phase * e->period / 255;
-    uint32_t t = (e->elapsedTime + phase_t) % e->period;
-    int32_t hi = (int32_t)e->offset * 2 + e->magnitude;
-    int32_t lo = (int32_t)e->offset * 2 - e->magnitude;
-    int32_t f = (t < e->period / 2) ? hi : lo;
-    return apply_envelope(e, f);
+    int32_t lvl = envelope_level(e, e->magnitude);
+    uint32_t t = periodic_time(e);
+    int32_t f = e->offset + ((t < e->period / 2) ? lvl : -lvl);
+    return f * e->gain / 255;
 }
 
 static int32_t calc_sine(const ffb_effect_t *e) {
     if (e->period == 0) return 0;
-    float angle = (2.0f * 3.14159265f * (float)e->elapsedTime) / (float)e->period
-                + (float)e->phase * 2.0f * 3.14159265f / 255.0f;
-    float f = (int16_t)e->offset * 2 + sinf(angle) * e->magnitude;
-    return apply_envelope(e, (int32_t)f);
+    int32_t lvl = envelope_level(e, e->magnitude);
+    uint32_t t = periodic_time(e);
+    float angle = 2.0f * 3.14159265f * (float)t / (float)e->period;
+    int32_t f = e->offset + (int32_t)(sinf(angle) * (float)lvl);
+    return f * e->gain / 255;
 }
 
 static int32_t calc_triangle(const ffb_effect_t *e) {
     if (e->period == 0) return 0;
-    uint32_t phase_t = (uint32_t)e->phase * e->period / 255;
-    uint32_t rem = (e->elapsedTime + phase_t) % e->period;
-    int32_t hi = (int16_t)e->offset * 2 + e->magnitude;
-    int32_t lo = (int16_t)e->offset * 2 - e->magnitude;
+    int32_t lvl = envelope_level(e, e->magnitude);
+    uint32_t rem = periodic_time(e);
+    int32_t hi = e->offset + lvl, lo = e->offset - lvl;
     float slope = (float)(hi - lo) * 2.0f / (float)e->period;
     float f = (rem < e->period / 2) ? (lo + slope * rem)
-                                    : (hi + slope * ((float)e->period - rem));
-    return apply_envelope(e, (int32_t)f);
+                                    : (hi - slope * (rem - e->period / 2));
+    return (int32_t)f * e->gain / 255;
 }
 
 static int32_t calc_sawtooth_up(const ffb_effect_t *e) {
     if (e->period == 0) return 0;
-    uint32_t phase_t = (uint32_t)e->phase * e->period / 255;
-    uint32_t rem = (e->elapsedTime + phase_t) % e->period;
-    int32_t hi = (int16_t)e->offset * 2 + e->magnitude;
-    int32_t lo = (int16_t)e->offset * 2 - e->magnitude;
+    int32_t lvl = envelope_level(e, e->magnitude);
+    uint32_t rem = periodic_time(e);
+    int32_t hi = e->offset + lvl, lo = e->offset - lvl;
     float slope = (float)(hi - lo) / (float)e->period;
-    int32_t f = (int32_t)(lo + slope * rem);
-    return apply_envelope(e, f);
+    return (int32_t)(lo + slope * rem) * e->gain / 255;
 }
 
 static int32_t calc_sawtooth_down(const ffb_effect_t *e) {
     if (e->period == 0) return 0;
-    uint32_t phase_t = (uint32_t)e->phase * e->period / 255;
-    uint32_t rem = (e->elapsedTime + phase_t) % e->period;
-    int32_t hi = (int16_t)e->offset * 2 + e->magnitude;
-    int32_t lo = (int16_t)e->offset * 2 - e->magnitude;
+    int32_t lvl = envelope_level(e, e->magnitude);
+    uint32_t rem = periodic_time(e);
+    int32_t hi = e->offset + lvl, lo = e->offset - lvl;
     float slope = (float)(hi - lo) / (float)e->period;
-    int32_t f = (int32_t)(hi - slope * rem);
-    return apply_envelope(e, f);
+    return (int32_t)(hi - slope * rem) * e->gain / 255;
 }
 
 /* Condition force: spring/damper/inertia/friction share this.
  * metric is the relevant axis signal normalized to -10000..10000
- * (matching the PID descriptor's condition parameter range). */
+ * (matching the PID descriptor's condition parameter range).
+ * PID formula: f = coefficient * (metric - (cp ± deadband)) — no sign flip
+ * on the negative side, or a centering spring turns into a one-way slam. */
 static int32_t calc_condition(const ffb_effect_t *e, int32_t metric) {
     int32_t cp  = e->cpOffset;
     int32_t db  = e->deadBand;
     int32_t f   = 0;
     if (metric < cp - db) {
-        f = (metric - (cp - db)) * (-(int32_t)e->negativeCoefficient) / 10000;
+        f = (metric - (cp - db)) * (int32_t)e->negativeCoefficient / 10000;
     } else if (metric > cp + db) {
         f = (metric - (cp + db)) * (int32_t)e->positiveCoefficient / 10000;
     }
     f = clip32(f, -(int32_t)e->negativeSaturation, (int32_t)e->positiveSaturation);
     return f * e->gain / 255;
+}
+
+/* Direction handling for force effects on a single-axis wheel. The PID
+ * Direction field is 0..255 = 0..360° clockwise from north; the X component
+ * is sin(angle) (east = 64 → +X, west = 192 → -X). Games that encode the
+ * sign in the magnitude instead send direction 0 (or leave Direction Enable
+ * clear) — pass those through unscaled. */
+static int32_t apply_direction(const ffb_effect_t *e, int32_t f) {
+    if (!(e->enableAxis & FFB_DIRECTION_ENABLE) || e->directionX == 0)
+        return f;
+    float angle = (float)e->directionX * (2.0f * 3.14159265f / 256.0f);
+    return (int32_t)((float)f * sinf(angle));
 }
 
 /* ============================================================ */
@@ -359,18 +428,19 @@ void ffb_calculate(const ffb_axis_metrics_t *m) {
         ffb_effect_t *e = &g_effects[id];
         if (!(e->state & FFB_STATE_PLAYING)) continue;
         e->elapsedTime = now - e->startTime;
-        if (e->duration != FFB_DURATION_INFINITE && e->elapsedTime > e->duration) {
+        if (e->totalDuration != FFB_TOTALDUR_INFINITE &&
+            e->elapsedTime > e->totalDuration) {
             stop_effect(id);
             continue;
         }
         switch (e->effectType) {
-            case FFB_EFFECT_CONSTANT:      force += calc_constant(e); break;
-            case FFB_EFFECT_RAMP:          force += calc_ramp(e); break;
-            case FFB_EFFECT_SQUARE:        force += calc_square(e); break;
-            case FFB_EFFECT_SINE:          force += calc_sine(e); break;
-            case FFB_EFFECT_TRIANGLE:      force += calc_triangle(e); break;
-            case FFB_EFFECT_SAWTOOTHUP:    force += calc_sawtooth_up(e); break;
-            case FFB_EFFECT_SAWTOOTHDOWN:  force += calc_sawtooth_down(e); break;
+            case FFB_EFFECT_CONSTANT:      force += apply_direction(e, calc_constant(e)); break;
+            case FFB_EFFECT_RAMP:          force += apply_direction(e, calc_ramp(e)); break;
+            case FFB_EFFECT_SQUARE:        force += apply_direction(e, calc_square(e)); break;
+            case FFB_EFFECT_SINE:          force += apply_direction(e, calc_sine(e)); break;
+            case FFB_EFFECT_TRIANGLE:      force += apply_direction(e, calc_triangle(e)); break;
+            case FFB_EFFECT_SAWTOOTHUP:    force += apply_direction(e, calc_sawtooth_up(e)); break;
+            case FFB_EFFECT_SAWTOOTHDOWN:  force += apply_direction(e, calc_sawtooth_down(e)); break;
             case FFB_EFFECT_SPRING:        force += calc_condition(e, m->position); break;
             case FFB_EFFECT_DAMPER:        force += calc_condition(e, m->velocity); break;
             case FFB_EFFECT_INERTIA:       force += calc_condition(e, m->acceleration); break;
@@ -379,8 +449,11 @@ void ffb_calculate(const ffb_axis_metrics_t *m) {
         }
     }
 
-    force = (int32_t)(force * (int32_t)g_device_gain / 255);
-    force = clip32(force, FFB_TORQUE_MIN, FFB_TORQUE_MAX);
+    /* Sum is in ±10000 descriptor units: clip, apply device gain, then
+     * convert to the engine's ±32767 output range. */
+    force = clip32(force, -FFB_UNIT_MAX, FFB_UNIT_MAX);
+    force = force * (int32_t)g_device_gain / 255;
+    force = force * FFB_TORQUE_MAX / FFB_UNIT_MAX;
     ffb_output_torque((int16_t)force);
 }
 

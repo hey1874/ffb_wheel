@@ -25,9 +25,15 @@
 #define ODRIVE_NODE_ID  0
 #endif
 
-/* Call once at startup: puts axis into CLOSED_LOOP + TORQUE mode.
- * Returns true if the heartbeat afterwards shows state 8. */
+/* Call once at startup: initializes the MCP2515 and sends the first
+ * CLOSED_LOOP + TORQUE mode request (non-blocking). Returns false only if
+ * the MCP2515 itself failed to initialize. */
 bool odrive_init(uint8_t node_id);
+
+/* Re-send the CLOSED_LOOP + TORQUE mode setup. Call periodically (e.g. 1 Hz)
+ * while odrive_is_closed_loop() is false, so a motor powered up after the
+ * Pico still gets armed. */
+void odrive_request_closed_loop(uint8_t node_id);
 
 /* Send a motor-side torque in Nm. Called from ffb_output_torque() at ~1 kHz. */
 void odrive_set_torque(uint8_t node_id, float nm);
@@ -42,5 +48,14 @@ float odrive_get_velocity(void);
 
 /* True if last heartbeat indicated CLOSED_LOOP. */
 bool odrive_is_closed_loop(void);
+
+/* Axis error from the last heartbeat (0 = no error). While nonzero the
+ * caller should stop commanding torque. */
+uint32_t odrive_axis_error(void);
+
+/* True once at least one Get_Encoder_Estimates frame has been received, i.e.
+ * odrive_get_position()/velocity() reflect real data rather than the initial
+ * zero. Used to defer center capture until the encoder is live. */
+bool odrive_has_encoder(void);
 
 #endif /* ODRIVE_CAN_H */

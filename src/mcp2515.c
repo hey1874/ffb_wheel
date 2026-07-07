@@ -2,7 +2,8 @@
  * mcp2515.c - MCP2515 SPI-CAN driver for RP2040 (Pico-SDK)
  *
  * Polling-mode driver: enough for ~1 kHz FFB torque + encoder polling.
- * TX uses buffer 0; RX uses buffer 0 with rollover disabled.
+ * TX uses buffer 0 (One-Shot Mode, no retransmission); RX uses buffer 0
+ * with rollover into buffer 1, both drained by mcp2515_receive().
  */
 #include "mcp2515.h"
 #include "hardware/spi.h"
@@ -89,15 +90,17 @@ bool mcp2515_init(void) {
     set_bitrate();
 
     /* RXB0: receive all standard frames (RXM=11), no filters (mask off),
-     * with buffer rollover to RXB1 (BUKT). */
+     * with buffer rollover to RXB1 (BUKT). RXB1 likewise accepts all frames
+     * and is drained by mcp2515_receive(). */
     mcp_write_reg(MCP_RXB0CTRL, 0x64);   /* RXM[1:0]=11, BUKT=1 */
+    mcp_write_reg(MCP_RXB1CTRL, 0x60);   /* RXM[1:0]=11 */
 
     /* Clear interrupts / flags */
     mcp_write_reg(MCP_CANINTF, 0x00);
     mcp_write_reg(MCP_CANINTE, 0x00);    /* polling: no interrupts */
 
-    /* Enter NORMAL mode */
-    mcp_write_reg(MCP_CANCTRL, MCP_MODE_NORMAL);
+    /* Enter NORMAL mode with One-Shot TX (see MCP_OSM in the header). */
+    mcp_write_reg(MCP_CANCTRL, MCP_MODE_NORMAL | MCP_OSM);
     for (int i = 0; i < 20; i++) {
         if ((mcp_read_reg(MCP_CANSTAT) & 0xE0) == MCP_MODE_NORMAL) break;
         sleep_ms(2);
@@ -107,12 +110,15 @@ bool mcp2515_init(void) {
 
 bool mcp2515_send(uint16_t id, const uint8_t *data, uint8_t len) {
     if (len > 8) len = 8;
-    /* Wait until TXB0 is not pending */
-    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + 50;
+    /* Wait briefly for TXB0 to free up. With One-Shot Mode a frame occupies
+     * the buffer for at most one bus attempt (~260 us @ 500k), so 2 ms only
+     * ever elapses if something is badly wrong — then abort the stale TX
+     * and drop this frame rather than stalling the 1 kHz FFB loop. */
+    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + 2;
     while (mcp_read_reg(MCP_TXB0CTRL) & 0x08) {
         if (to_ms_since_boot(get_absolute_time()) > deadline) {
-            /* Abort stale TX if stuck */
             mcp_bit_modify(MCP_TXB0CTRL, 0x08, 0x00);
+            if (mcp_read_reg(MCP_TXB0CTRL) & 0x08) return false;
             break;
         }
     }
@@ -139,15 +145,26 @@ bool mcp2515_receive(uint16_t *id, uint8_t *data, uint8_t *len) {
     spi_read_blocking(MCP_SPI, 0, &status, 1);
     cs_high();
 
-    if (!(status & 0x01)) return false;   /* RX0IF not set */
+    /* Drain RXB0 first, then RXB1 (rollover target). Skipping RXB1 would
+     * leave it permanently full after the first rollover. */
+    uint8_t sidh, sidl, dlc, d0, intf;
+    if (status & 0x01) {          /* RX0IF */
+        sidh = MCP_RXB0SIDH; sidl = MCP_RXB0SIDL;
+        dlc  = MCP_RXB0DLC;  d0   = MCP_RXB0D0;   intf = 0x01;
+    } else if (status & 0x02) {   /* RX1IF */
+        sidh = MCP_RXB1SIDH; sidl = MCP_RXB1SIDL;
+        dlc  = MCP_RXB1DLC;  d0   = MCP_RXB1D0;   intf = 0x02;
+    } else {
+        return false;
+    }
 
-    *id  = ((uint16_t)mcp_read_reg(MCP_RXB0SIDH) << 3)
-         | ((mcp_read_reg(MCP_RXB0SIDL) >> 5) & 0x07);
-    *len = mcp_read_reg(MCP_RXB0DLC) & 0x0F;
+    *id  = ((uint16_t)mcp_read_reg(sidh) << 3)
+         | ((mcp_read_reg(sidl) >> 5) & 0x07);
+    *len = mcp_read_reg(dlc) & 0x0F;
     if (*len > 8) *len = 8;
     for (uint8_t i = 0; i < *len; i++)
-        data[i] = mcp_read_reg(MCP_RXB0D0 + i);
+        data[i] = mcp_read_reg(d0 + i);
 
-    mcp_bit_modify(MCP_CANINTF, 0x01, 0x00);  /* clear RX0IF */
+    mcp_bit_modify(MCP_CANINTF, intf, 0x00);  /* clear RXnIF */
     return true;
 }
