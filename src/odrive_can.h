@@ -22,7 +22,7 @@
 #include <stdbool.h>
 
 #ifndef ODRIVE_NODE_ID
-#define ODRIVE_NODE_ID  0
+#define ODRIVE_NODE_ID  1  /* CyberBeast BL72 factory default */
 #endif
 
 /* Call once at startup: initializes the MCP2515 and sends the first

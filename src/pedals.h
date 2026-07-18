@@ -23,7 +23,7 @@
 
 /* Number of analog pedals (consecutive ADC channels starting at channel 0). */
 #ifndef PEDAL_COUNT
-#define PEDAL_COUNT 3
+#define PEDAL_COUNT 0  /* set to 3 when pedals are wired */
 #endif
 
 /* GPIO of ADC channel 0. On both RP2040 and RP2350 this is GP26; channels
