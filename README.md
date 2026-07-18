@@ -155,6 +155,12 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 若速率太慢(默认常为 ~10-100ms),1kHz 的弹簧/阻尼拿陈旧位置计算会发涩发抖。**
 在 ODrive 侧把编码器广播设到 ~1ms(如 `axis0.config.can.encoder_msg_rate_ms = 1`)。
 
+### 3.1. CyberBeast BL72 (GIM6010-8) 上机注意
+- **CAN node_id 未必是 0**: 部分出厂电机的 `axis0.config.can.node_id = 1`, 与固件默认 `ODRIVE_NODE_ID=0` 不匹配, CAN 收发不到。上机后先通过 USB-C 串口读取 `r axis0.config.can.node_id`, 如为 1 则改为 0 并 `sc` 保存。
+- **CAN 广播默认开启**: 出厂的 `heartbeat_rate_ms=100` 和 `encoder_rate_ms=10` 已打开, 无需额外配置。
+- **USB 与 CAN 可同时工作** (硬件版本 ≥ 3.8): 调测时电机 USB-C 和 RP2040 CAN 可以同时接 Mac, 不会冲突。
+- **拔掉电机 USB 有助于 CAN 稳定**: 实际测试发现某些情况下同时连接会导致 CAN 帧间歇丢失, 建议调试完成后拔掉电机 USB-C。
+
 ### 4. 开启 ODrive CAN watchdog(安全)
 固件若卡死/崩溃,ODrive 会保持最后一次力矩,盘可能被顶死。开启轴看门狗
 (`axis0.config.enable_watchdog = True`, `watchdog_timeout ≈ 0.05`),本固件 1kHz 的
@@ -193,6 +199,9 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 效果引擎 (ffb.c / ffb_types.h):
 
 11. `calc_condition` 负系数错误取反 → 弹簧两侧输出同向力, 方向盘会猛拉向一边; 按 PID 规范公式去掉负号
+    > **2026-07-18 修正: 之前去掉负号是错误的, 导致弹簧/阻尼产生正反馈(越偏离中心力越大越同向)。
+    > 负号是 OpenFFBoard/VNWheel 原始公式的一部分, 正确公式为 `f = -(metric - cp) * coeff / 10000`,
+    > 缺失负号会导致弹簧推离中心而非拉回中心。已将负号加回。
 12. 力度标度统一: 描述符 magnitude 范围是 ±10000, 引擎却按 ±32767 满量程 → 恒定力只有 30%; 周期效果的 magnitude 还在包络里被二次相乘 (≈9%)。现在全部效果在 ±10000 单位下计算, `ffb_calculate` 末端统一换算到 ±32767
 13. Set Envelope 的 attackTime/fadeTime 描述符是 32 位字段, 结构体误用 uint16 → fadeTime 永远读到 0; Set Periodic 的 period 同理改为 uint32
 14. 相位单位: 描述符是 0..35999 (0.01°), 代码原按 0..255 处理
