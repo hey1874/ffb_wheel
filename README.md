@@ -156,9 +156,9 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 在 ODrive 侧把编码器广播设到 ~1ms(如 `axis0.config.can.encoder_msg_rate_ms = 1`)。
 
 ### 3.1. CyberBeast BL72 (GIM6010-8) 上机注意
-- **CAN node_id 未必是 0**: 部分出厂电机的 `axis0.config.can.node_id = 1`, 与固件默认 `ODRIVE_NODE_ID=0` 不匹配, CAN 收发不到。上机后先通过 USB-C 串口读取 `r axis0.config.can.node_id`, 如为 1 则改为 0 并 `sc` 保存。
+- **CAN node_id 出厂默认为 1**: 编译时务必 `-DODRIVE_NODE_ID=1` 匹配电机。电机侧 node_id 写死无法通过 ASCII 修改，`sc` 命令会从闪存恢复默认值。
 - **CAN 广播默认开启**: 出厂的 `heartbeat_rate_ms=100` 和 `encoder_rate_ms=10` 已打开, 无需额外配置。
-- **USB 与 CAN 可同时工作** (硬件版本 ≥ 3.8): 调测时电机 USB-C 和 RP2040 CAN 可以同时接 Mac, 不会冲突。
+- **上电顺序**: 电机先上电, RP2040 后上电。固件启动时初始化 MCP2515, 如果电机没电 CAN 总线无设备。
 - **拔掉电机 USB 有助于 CAN 稳定**: 实际测试发现某些情况下同时连接会导致 CAN 帧间歇丢失, 建议调试完成后拔掉电机 USB-C。
 
 ### 4. 开启 ODrive CAN watchdog(安全)
