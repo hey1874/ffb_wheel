@@ -391,9 +391,9 @@ static int32_t calc_condition(const ffb_effect_t *e, int32_t metric) {
     int32_t db  = e->deadBand;
     int32_t f   = 0;
     if (metric < cp - db) {
-        f = -(int32_t)(metric - (cp - db)) * (int32_t)e->negativeCoefficient / 10000;
+        f = (metric - (cp - db)) * (int32_t)e->negativeCoefficient / 10000;
     } else if (metric > cp + db) {
-        f = -(int32_t)(metric - (cp + db)) * (int32_t)e->positiveCoefficient / 10000;
+        f = (metric - (cp + db)) * (int32_t)e->positiveCoefficient / 10000;
     }
     f = clip32(f, -(int32_t)e->negativeSaturation, (int32_t)e->positiveSaturation);
     return f * e->gain / 255;

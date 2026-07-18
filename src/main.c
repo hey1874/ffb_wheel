@@ -73,7 +73,7 @@
 #define ENCODER_SIGN  (+1)
 #endif
 #ifndef TORQUE_SIGN
-#define TORQUE_SIGN   (+1)
+#define TORQUE_SIGN   (-1)  /* CyberBeast BL72: positive torque = CW rotation */
 #endif
 
 /* Capture the wheel's power-on position as center once the encoder goes live
