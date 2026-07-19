@@ -124,7 +124,7 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 | `MAX_NM` | 4.0 | FFB 满量程对应的电机侧力矩 (Nm) |
 | `WHEEL_MAX_TURNS` | 2.0 | ±圈数输出 (2.0 = ±720°) |
 | `ENCODER_SIGN` | +1 | 编码器方向 (方向盘转向反了改 -1) |
-| `TORQUE_SIGN` | +1 | 力矩方向 (弹簧不回中/失控时改 -1) |
+| `TORQUE_SIGN` | -1 | 力矩方向 (BL72 默认 -1, 若弹簧反向则改 +1) |
 | `WHEEL_CENTER_AT_BOOT` | 1 | 开机编码器就绪时把当前位置设为中心 (0 = 用 ODrive 编码器零点) |
 | `ODRIVE_NODE_ID` | 0 | 电机 CAN 节点 ID |
 | `MCP_BAUD` | 500000 | CAN 波特率 |
@@ -199,9 +199,9 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 效果引擎 (ffb.c / ffb_types.h):
 
 11. `calc_condition` 负系数错误取反 → 弹簧两侧输出同向力, 方向盘会猛拉向一边; 按 PID 规范公式去掉负号
-    > **2026-07-18 修正: 之前去掉负号是错误的, 导致弹簧/阻尼产生正反馈(越偏离中心力越大越同向)。
-    > 负号是 OpenFFBoard/VNWheel 原始公式的一部分, 正确公式为 `f = -(metric - cp) * coeff / 10000`,
-    > 缺失负号会导致弹簧推离中心而非拉回中心。已将负号加回。
+    > **2026-07-19 实机验证: `calc_condition` 公式 `f = (metric - cp) * coeff / 10000` 本身正确，
+    > 无需加负号。弹簧方向由 `TORQUE_SIGN` 校准。CyberBeast BL72 电机正扭矩 = CW 旋转，
+    > 需设 `TORQUE_SIGN=-1` 使正系数产生回中力。已在 `main.c` 中设为默认值。
 12. 力度标度统一: 描述符 magnitude 范围是 ±10000, 引擎却按 ±32767 满量程 → 恒定力只有 30%; 周期效果的 magnitude 还在包络里被二次相乘 (≈9%)。现在全部效果在 ±10000 单位下计算, `ffb_calculate` 末端统一换算到 ±32767
 13. Set Envelope 的 attackTime/fadeTime 描述符是 32 位字段, 结构体误用 uint16 → fadeTime 永远读到 0; Set Periodic 的 period 同理改为 uint32
 14. 相位单位: 描述符是 0..35999 (0.01°), 代码原按 0..255 处理
