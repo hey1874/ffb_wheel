@@ -55,11 +55,26 @@
 #define MAX_NM  4.0f
 #endif
 
-/* Steering wheel physical range (output-side turns). ±2 turns = ±720°.
- * Used to normalize motor position to the descriptor's int16 axis range
- * and to the PID -10000..10000 condition metric range. */
+/* Steering wheel range: output-side turns from center to full lock (i.e. the
+ * ± amplitude). 1.5 = ±1.5 turns = ±540° = 1080° lock-to-lock. This sets the
+ * motor-turns → int16 axis and → ±10000 condition-metric scaling. Common
+ * values: 1.25 → 900°, 1.5 → 1080°, 2.0 → 1440°, 1.0 → 720° total. */
 #ifndef WHEEL_MAX_TURNS
-#define WHEEL_MAX_TURNS  2.0f
+#define WHEEL_MAX_TURNS  1.5f
+#endif
+
+/* Soft end-stop (bump-stop): past ±WHEEL_MAX_TURNS the firmware adds a strong
+ * centering torque that ramps from 0 to full over ENDSTOP_RANGE_DEG of extra
+ * travel, simulating the steering rack hitting its limit instead of spinning
+ * freely. ENDSTOP_NM = the wall's peak torque (rim Nm, effectively capped at
+ * MAX_NM); set 0 to disable. Shares the centering-spring sign convention, so if
+ * the calc_condition sign is ever changed (see README known issue #2), flip
+ * this wall's sign to match. */
+#ifndef ENDSTOP_NM
+#define ENDSTOP_NM  MAX_NM
+#endif
+#ifndef ENDSTOP_RANGE_DEG
+#define ENDSTOP_RANGE_DEG  10.0f
 #endif
 
 /* Gearbox ratio: motor turns per output turn. */
@@ -223,6 +238,31 @@ static int16_t read_wheel_axis(void) {
     return (int16_t)v;
 }
 
+/* Soft end-stop: once past ±WHEEL_MAX_TURNS, add a centering torque that ramps
+ * 0→full over ENDSTOP_RANGE_DEG of over-travel, so the rim meets a firm "wall"
+ * at the set lock instead of spinning on. Added on top of the FFB engine output
+ * (outside the game's device gain), in the healthy-drive path only. Same sign
+ * convention as the centering spring. */
+static void apply_endstop(void) {
+    const float wall_nm = (float)(ENDSTOP_NM);
+    if (wall_nm <= 0.0f) return;                       /* disabled */
+    float pos_out = enc_position() / GEAR_RATIO;       /* output turns, signed */
+    float mag  = pos_out < 0 ? -pos_out : pos_out;
+    float over = mag - (float)(WHEEL_MAX_TURNS);       /* turns past the lock */
+    if (over <= 0.0f) return;                          /* inside travel */
+    float range = (float)(ENDSTOP_RANGE_DEG) / 360.0f; /* over-travel to full */
+    float frac  = (range > 0.0f) ? over / range : 1.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    /* Wall in engine units (±32767 = MAX_NM rim); core1 caps the total at
+     * MAX_NM, so ENDSTOP_NM above MAX_NM just saturates. */
+    float wall = (pos_out < 0 ? -1.0f : 1.0f) * frac
+               * (wall_nm / (float)(MAX_NM)) * 32767.0f;
+    int32_t t = (int32_t)g_torque_cmd + (int32_t)wall;
+    if (t >  32767) t =  32767;
+    if (t < -32767) t = -32767;
+    g_torque_cmd = (int16_t)t;
+}
+
 /* ============================================================ */
 /* TinyUSB device callbacks — safety: never keep pushing after   */
 /* the host goes away (game crash, unplug, suspend).             */
@@ -371,7 +411,8 @@ int main(void) {
                     .velocity     = read_encoder_velocity(),
                     .acceleration = read_encoder_acceleration()
                 };
-                ffb_calculate(&m);
+                ffb_calculate(&m);   /* → g_torque_cmd (FFB effects) */
+                apply_endstop();     /* add the rack-limit wall on top */
             }
         }
 

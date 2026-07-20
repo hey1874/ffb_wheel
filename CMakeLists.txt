@@ -39,7 +39,8 @@ target_include_directories(ffb_wheel PRIVATE src)
 # #ifndef default silently wins. (BUTTON_GPIOS is a brace list — cmake mangles
 # the commas — so set that one in buttons.h, not via -D.)
 foreach(_opt
-    MAX_NM WHEEL_MAX_TURNS ENCODER_SIGN TORQUE_SIGN WHEEL_CENTER_AT_BOOT
+    MAX_NM WHEEL_MAX_TURNS ENDSTOP_NM ENDSTOP_RANGE_DEG
+    ENCODER_SIGN TORQUE_SIGN WHEEL_CENTER_AT_BOOT
     ODRIVE_NODE_ID MCP_BAUD MCP_OSC_HZ MCP_SPI_HZ
     MCP_SCK_PIN MCP_MOSI_PIN MCP_MISO_PIN MCP_CS_PIN
     PEDAL_COUNT PEDAL_ADC_BASE_GPIO PEDAL_INVERT_MASK
