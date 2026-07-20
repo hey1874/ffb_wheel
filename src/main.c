@@ -26,6 +26,7 @@
 #include "ffb.h"
 #include "odrive_can.h"
 #include "pedals.h"
+#include "buttons.h"
 
 /* ============================================================ */
 /* Configuration                                                */
@@ -296,6 +297,7 @@ int main(void) {
 
     ffb_init();
     pedals_init();
+    buttons_init();
 
     /* Hand the CAN link to core1 (MCP2515 init + torque stream + polling). */
     multicore_launch_core1(core1_entry);
@@ -348,14 +350,15 @@ int main(void) {
             if (tud_hid_ready()) {
                 int16_t x = read_wheel_axis();
                 /* Pedals → Y (throttle), Z (brake), Rx (clutch). Guards are
-                 * compile-time constants, so this is safe for any PEDAL_COUNT. */
-                int16_t ped[PEDAL_COUNT] = {0};
+                 * compile-time constants, so this is safe for any PEDAL_COUNT.
+                 * Size ≥1 so PEDAL_COUNT==0 isn't a zero-length array. */
+                int16_t ped[PEDAL_COUNT > 0 ? PEDAL_COUNT : 1] = {0};
                 pedals_read(ped);
                 int16_t thr = (PEDAL_COUNT > 0) ? ped[0] : 0;
                 int16_t brk = (PEDAL_COUNT > 1) ? ped[1] : 0;
                 int16_t clu = (PEDAL_COUNT > 2) ? ped[2] : 0;
                 uint8_t buf[sizeof(ffb_wheel_report_t)];
-                ffb_build_wheel_report(buf, sizeof(buf), 0,
+                ffb_build_wheel_report(buf, sizeof(buf), buttons_read(),
                                         x, thr, brk, clu, 0, 0);
                 tud_hid_report(FFB_RID_WHEEL, buf, sizeof(buf));
             }

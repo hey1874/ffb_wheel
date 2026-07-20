@@ -28,9 +28,27 @@ add_executable(ffb_wheel
     src/mcp2515.c      # MCP2515 SPI-CAN driver
     src/odrive_can.c   # ODrive CAN protocol (torque + encoder polling)
     src/pedals.c       # Analog pedals (throttle/brake/clutch) via on-chip ADC
+    src/buttons.c      # Momentary buttons via GPIO (debounced, up to 32)
 )
 
 target_include_directories(ffb_wheel PRIVATE src)
+
+# ---- Build-time tuning knobs ----
+# Forward -D<NAME>=<val> from the cmake command line to the compiler. Without
+# this, `cmake -DMAX_NM=3.0` only sets an unused CMake cache variable and the C
+# #ifndef default silently wins. (BUTTON_GPIOS is a brace list — cmake mangles
+# the commas — so set that one in buttons.h, not via -D.)
+foreach(_opt
+    MAX_NM WHEEL_MAX_TURNS ENCODER_SIGN TORQUE_SIGN WHEEL_CENTER_AT_BOOT
+    ODRIVE_NODE_ID MCP_BAUD MCP_OSC_HZ MCP_SPI_HZ
+    MCP_SCK_PIN MCP_MOSI_PIN MCP_MISO_PIN MCP_CS_PIN
+    PEDAL_COUNT PEDAL_ADC_BASE_GPIO PEDAL_INVERT_MASK
+    BUTTON_CHIPS BUTTON_SDA_PIN BUTTON_SCL_PIN BUTTON_I2C_HZ
+    BUTTON_ADDR0 BUTTON_ADDR1 BUTTON_DEBOUNCE)
+  if(DEFINED ${_opt})
+    target_compile_definitions(ffb_wheel PRIVATE ${_opt}=${${_opt}})
+  endif()
+endforeach()
 
 # tinyusb_device: TinyUSB device stack (uses our src/tusb_config.h).
 # tinyusb_board:   board_init/led/serial glue for RP2040.
@@ -45,6 +63,7 @@ target_link_libraries(ffb_wheel
     hardware_spi
     hardware_gpio
     hardware_adc      # on-chip ADC for analog pedals (pedals.c)
+    hardware_i2c      # MCP23017 button expander(s) (buttons.c)
 )
 
 # Emit .uf2, .hex, .disasm

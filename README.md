@@ -66,7 +66,9 @@ ffb_wheel/
     ├── odrive_can.h            # ODrive CAN 协议 API
     ├── odrive_can.c            # ODrive 实现 (力矩 + 编码器轮询)
     ├── pedals.h                # 模拟踏板接口 (油门/刹车/离合)
-    └── pedals.c                # 片上 ADC 读踏板, 过采样+低通+自动量程
+    ├── pedals.c                # 片上 ADC 读踏板, 过采样+低通+自动量程
+    ├── buttons.h               # 按钮接口 (MCP23017 I²C 扩展, 最多 32 键)
+    └── buttons.c               # I²C 读扩展芯片, 去抖 (带超时, 不阻塞 USB)
 ```
 
 ## 工作原理
@@ -118,6 +120,20 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 > - **有源 0-5V 传感器**: 分压到 0-3.3V, 或外接 ADS1115 (I²C), 切勿把 5V 直连 ADC 脚。
 > - 不接的踏板务必同时调低 `PEDAL_COUNT`; 悬空的 ADC 脚会因噪声被自动量程误标定。
 
+## 按钮 (方向盘 / 按钮盒)
+
+HID 描述符声明了 **32 个按钮**。`buttons.c` 用 **MCP23017 I²C GPIO 扩展芯片**读取,
+一片 16 键、两片 32 键,只占 2 根 I²C 线(SDA/SCL),接线远少于直连 GPIO:
+
+- 默认 **禁用** (`BUTTON_CHIPS=0`); 接了芯片编译时设 `-DBUTTON_CHIPS=1`(或 2)。
+- 默认 I²C: **i2c0 = GP20(SDA) / GP21(SCL)**; 两片地址 `0x20` / `0x21`(由芯片 A2/A1/A0 脚设定)。
+- 按钮接在 MCP23017 的 GPIO 脚与 **GND** 之间(片内上拉已开,无需外部电阻); I²C 线建议各加 ~4.7k 上拉到 3V3。
+- 每键做 ~12ms 去抖(在 ~250Hz 输入报告节拍上扫描)。
+- **I²C 全部带超时**: 芯片没接/无响应时降级为"无按钮", 绝不阻塞 core0 的 USB 循环。
+
+> ⚠️ MCP23017 若用 5V 供电, 其 I²C 线**不要**直连 RP2040(非 5V 耐受)。用 3V3 供电最省心。
+> 要超过 32 键需改 HID 描述符位宽(DirectInput 上限 128)。
+
 ## 游戏兼容性
 使用 OpenFFBoard 的 VID/PID (0x1209/0xFFB0)，因此按 ID 注册设备的游戏 (Dirt, EA WRC) 无需编辑 XML 即可识别本方向盘。兼容任何 DirectInput FFB 游戏: Assetto Corsa, iRacing, rFactor 2, BeamNG, Forza 等。
 
@@ -136,6 +152,11 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 | `MCP_SPI_HZ` | 5000000 | MCP2515 的 SPI 时钟 |
 | `PEDAL_COUNT` | 0 | 模拟踏板数量 (ADC 通道数; 默认禁用, 接了踏板改 3) |
 | `PEDAL_INVERT_MASK` | 0x00 | 踏板反向位掩码 (bit i = 第 i 路反向) |
+| `BUTTON_CHIPS` | 0 | MCP23017 按钮扩展芯片数 (0=禁用, 1=16 键, 2=32 键) |
+| `BUTTON_SDA_PIN` / `BUTTON_SCL_PIN` | 20 / 21 | I²C 引脚 (默认 i2c0) |
+| `BUTTON_ADDR0` / `BUTTON_ADDR1` | 0x20 / 0x21 | 两片 MCP23017 的 I²C 地址 |
+
+> 这些 `-D` 标志现在通过 CMakeLists 转发到编译器才真正生效 (见修复记录 36)。
 
 ## 上机调试 (bring-up)
 
@@ -250,5 +271,11 @@ CAN / USB 稳定性 (mcp2515.c, main.c, CMakeLists.txt):
 35. 力矩三条件门控: 仅当 `!axis_error && closed_loop` 才输出力矩, 否则恒 0 (含离线超时窗口)
 
 > ⚠️ 30/31 (整帧 SPI 指令) 与 32-35 尚未实机验证, 请编译后上机确认 CAN 收发与掉电恢复行为。
+
+### 2026-07-20 按钮支持与构建修复
+
+36. **`-D` 调优标志此前完全不生效**: CMakeLists 从未把 `cmake -DMAX_NM=...` 转发给编译器, 只是设了个没人用的 CMake 缓存变量, C 里 `#ifndef` 默认值一直赢。现加 foreach 转发块, README 里所有 `-D` 标志(含 MAX_NM/TORQUE_SIGN/PEDAL_COUNT/BUTTON_CHIPS)才真正可覆盖
+37. 按钮支持: HID 描述符按钮 8→32, 报告结构体 `buttons` uint8→uint32; 新增 `buttons.c` 走 MCP23017 I²C(1-2 片, 16/32 键, 带超时去抖)。默认禁用
+38. 修掉 `PEDAL_COUNT=0` 时 `int16_t ped[0]` 的零长数组告警(数组尺寸取 `max(1, PEDAL_COUNT)`)
 
 ⚠️ 待实机核实: `MAX_NM` 的量纲 — Set_Input_Torque 通常是减速箱**之前**的电机侧力矩, 4 Nm × 8:1 意味着盘端最高 ~32 Nm; 而如果手册的 "5 Nm 额定" 是输出侧, 电机侧额定仅 ~0.6 Nm。两种解读必有一错, 上机前先用低值 (如 `-DMAX_NM=0.5`) 验证。

@@ -93,7 +93,7 @@
 
 /* ---- Input report structures (no reportId byte) ---- */
 typedef struct __attribute__((packed)) {
-    uint8_t  buttons;
+    uint32_t buttons;         /* 32 buttons, bit i = button (i+1) */
     int16_t  xAxis;
     int16_t  yAxis;
     int16_t  zAxis;

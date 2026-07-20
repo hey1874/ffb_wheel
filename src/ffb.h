@@ -46,7 +46,7 @@ void ffb_calculate(const ffb_axis_metrics_t *metrics);
 /* Build the periodic wheel input report (axes + buttons). Returns bytes
  * written (0 if buffer too small). */
 uint16_t ffb_build_wheel_report(uint8_t *buffer, uint16_t reqlen,
-                                uint8_t buttons,
+                                uint32_t buttons,
                                 int16_t x, int16_t y, int16_t z,
                                 int16_t rx, int16_t ry, int16_t rz);
 
