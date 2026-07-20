@@ -38,6 +38,7 @@ target_include_directories(ffb_wheel PRIVATE src)
 # hardware_gpio:   Pico-SDK GPIO driver (CS pin, used by mcp2515.c).
 target_link_libraries(ffb_wheel
     pico_stdlib
+    pico_multicore    # core1 runs the CAN link (main.c core1_entry)
     tinyusb_device
     tinyusb_board
     hardware_timer

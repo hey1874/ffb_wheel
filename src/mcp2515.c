@@ -110,26 +110,31 @@ bool mcp2515_init(void) {
 
 bool mcp2515_send(uint16_t id, const uint8_t *data, uint8_t len) {
     if (len > 8) len = 8;
-    /* Wait briefly for TXB0 to free up. With One-Shot Mode a frame occupies
-     * the buffer for at most one bus attempt (~260 us @ 500k), so 2 ms only
-     * ever elapses if something is badly wrong — then abort the stale TX
-     * and drop this frame rather than stalling the 1 kHz FFB loop. */
-    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + 2;
-    while (mcp_read_reg(MCP_TXB0CTRL) & 0x08) {
-        if (to_ms_since_boot(get_absolute_time()) > deadline) {
-            mcp_bit_modify(MCP_TXB0CTRL, 0x08, 0x00);
-            if (mcp_read_reg(MCP_TXB0CTRL) & 0x08) return false;
-            break;
-        }
-    }
-    /* Standard 11-bit ID into SIDH/SIDL */
-    mcp_write_reg(MCP_TXB0SIDH, (uint8_t)(id >> 3));
-    mcp_write_reg(MCP_TXB0SIDL, (uint8_t)((id & 0x07) << 5));
-    mcp_write_reg(MCP_TXB0DLC, len & 0x0F);
-    for (uint8_t i = 0; i < len; i++)
-        mcp_write_reg(MCP_TXB0D0 + i, data[i]);
+    /* Non-blocking. If TXB0 is still occupied by a previous frame (lost
+     * arbitration, bus error, no ACK), abort it: for a 1 kHz torque stream the
+     * newest command supersedes a stale one, and never busy-waiting keeps this
+     * off any hot path. In One-Shot Mode TXREQ self-clears after one attempt,
+     * so this abort only fires on a genuinely stuck/in-flight frame. */
+    if (mcp_read_reg(MCP_TXB0CTRL) & 0x08)
+        mcp_bit_modify(MCP_TXB0CTRL, 0x08, 0x00);   /* clear TXREQ = abort */
 
-    /* Request to send TXB0 */
+    /* Load the whole frame (SIDH..DLC + data) in ONE CS assertion via the
+     * LOAD TX BUFFER instruction, instead of ~13 discrete register writes. */
+    uint8_t frame[6 + 8];
+    frame[0] = MCP_LOAD_TX0;                 /* load starting @ TXB0SIDH */
+    frame[1] = (uint8_t)(id >> 3);           /* SIDH: SID[10:3] */
+    frame[2] = (uint8_t)((id & 0x07) << 5);  /* SIDL: SID[2:0], EXIDE=0 (std) */
+    frame[3] = 0;                            /* EID8 (unused, standard frame) */
+    frame[4] = 0;                            /* EID0 (unused) */
+    frame[5] = (uint8_t)(len & 0x0F);        /* DLC, RTR=0 */
+    for (uint8_t i = 0; i < len; i++)
+        frame[6 + i] = data[i];
+
+    cs_low();
+    spi_write_blocking(MCP_SPI, frame, (size_t)(6 + len));
+    cs_high();
+
+    /* Request-to-send TXB0 (RTS is its own single-byte instruction). */
     uint8_t rts = MCP_RTS_TX0;
     cs_low();
     spi_write_blocking(MCP_SPI, &rts, 1);
@@ -147,24 +152,25 @@ bool mcp2515_receive(uint16_t *id, uint8_t *data, uint8_t *len) {
 
     /* Drain RXB0 first, then RXB1 (rollover target). Skipping RXB1 would
      * leave it permanently full after the first rollover. */
-    uint8_t sidh, sidl, dlc, d0, intf;
-    if (status & 0x01) {          /* RX0IF */
-        sidh = MCP_RXB0SIDH; sidl = MCP_RXB0SIDL;
-        dlc  = MCP_RXB0DLC;  d0   = MCP_RXB0D0;   intf = 0x01;
-    } else if (status & 0x02) {   /* RX1IF */
-        sidh = MCP_RXB1SIDH; sidl = MCP_RXB1SIDL;
-        dlc  = MCP_RXB1DLC;  d0   = MCP_RXB1D0;   intf = 0x02;
-    } else {
-        return false;
-    }
+    uint8_t cmd;
+    if (status & 0x01)        cmd = MCP_READ_RX0;   /* RX0IF */
+    else if (status & 0x02)   cmd = MCP_READ_RX1;   /* RX1IF */
+    else                      return false;
 
-    *id  = ((uint16_t)mcp_read_reg(sidh) << 3)
-         | ((mcp_read_reg(sidl) >> 5) & 0x07);
-    *len = mcp_read_reg(dlc) & 0x0F;
-    if (*len > 8) *len = 8;
-    for (uint8_t i = 0; i < *len; i++)
-        data[i] = mcp_read_reg(d0 + i);
+    /* One CS assertion reads SIDH,SIDL,EID8,EID0,DLC + 8 data bytes. Raising CS
+     * after a READ RX BUFFER instruction auto-clears the RXnIF flag, so no
+     * separate CANINTF bit-modify is needed. */
+    uint8_t buf[13];
+    cs_low();
+    spi_write_blocking(MCP_SPI, &cmd, 1);
+    spi_read_blocking(MCP_SPI, 0, buf, sizeof(buf));
+    cs_high();
 
-    mcp_bit_modify(MCP_CANINTF, intf, 0x00);  /* clear RXnIF */
+    *id = ((uint16_t)buf[0] << 3) | ((buf[1] >> 5) & 0x07);
+    uint8_t l = buf[4] & 0x0F;
+    if (l > 8) l = 8;
+    *len = l;
+    for (uint8_t i = 0; i < l; i++)
+        data[i] = buf[5 + i];
     return true;
 }

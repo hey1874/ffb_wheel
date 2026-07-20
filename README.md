@@ -9,12 +9,17 @@
 ```
 游戏 (DirectInput)
   ↕ USB HID FFB (PID 1.0, Usage Page 0x0F)
-RP2040 (TinyUSB)
-  ├── FFB 效果引擎 (ffb.c) — 11 种效果, 40 槽位池
-  └── MCP2515 SPI-CAN (mcp2515.c)
+RP2040 (TinyUSB) — 双核
+  ├─ core0: USB (tud_task) + FFB 效果引擎 (ffb.c) — 11 种效果, 40 槽位池
+  │            └─ ffb_output_torque() → g_torque_cmd ─┐ (跨核单字, 无锁)
+  └─ core1: MCP2515 SPI-CAN (mcp2515.c) ←─────────────┘
        ↕ CAN 500kbaud (ODrive 协议)
 GIM6010-8 电机 (ODrive 固件 v0.5.16)
 ```
+
+> **双核隔离**: 所有 SPI/CAN 收发都在 core1, USB 独占 core0。CAN 再怎么阻塞/出错
+> 都不会拖住 `tud_task()`, USB 时序与 CAN 完全解耦。跨核只共享几个 32/16 位对齐单字
+> (RP2040 无数据缓存 → 天然无撕裂), 故无需加锁。
 
 ## 硬件
 
@@ -125,11 +130,11 @@ HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP
 | `WHEEL_MAX_TURNS` | 2.0 | ±圈数输出 (2.0 = ±720°) |
 | `ENCODER_SIGN` | +1 | 编码器方向 (方向盘转向反了改 -1) |
 | `TORQUE_SIGN` | -1 | 力矩方向 (BL72 默认 -1, 若弹簧反向则改 +1) |
-| `WHEEL_CENTER_AT_BOOT` | 1 | 开机编码器就绪时把当前位置设为中心 (0 = 用 ODrive 编码器零点) |
-| `ODRIVE_NODE_ID` | 0 | 电机 CAN 节点 ID |
+| `WHEEL_CENTER_AT_BOOT` | 1 | 编码器每次就绪(开机 / 电机掉电重连)时把当前位置设为中心 (0 = 用 ODrive 编码器零点) |
+| `ODRIVE_NODE_ID` | 1 | 电机 CAN 节点 ID (CyberBeast BL72 出厂默认 1) |
 | `MCP_BAUD` | 500000 | CAN 波特率 |
 | `MCP_SPI_HZ` | 5000000 | MCP2515 的 SPI 时钟 |
-| `PEDAL_COUNT` | 3 | 模拟踏板数量 (ADC 通道数) |
+| `PEDAL_COUNT` | 0 | 模拟踏板数量 (ADC 通道数; 默认禁用, 接了踏板改 3) |
 | `PEDAL_INVERT_MASK` | 0x00 | 踏板反向位掩码 (bit i = 第 i 路反向) |
 
 ## 上机调试 (bring-up)
@@ -225,5 +230,25 @@ CAN 驱动 (mcp2515.c):
 
 27. 启用 One-Shot 模式: 电机断电/无 ACK 时 TXREQ 不再永久挂起 (原来每帧阻塞 50ms, 主循环掉到 20Hz 拖死 USB); TX 等待缩短到 2ms
 28. 接收路径补上 RXB1: 原来开了 BUKT rollover 但从不读 RXB1/清 RX1IF, 首次 rollover 后 RXB1 永久占用
+
+### 2026-07-20 稳定性与掉电恢复
+
+效果引擎 (main.c):
+
+29. Inertia 加速度估计恒为 0: 1kHz 调用时 `dt` 正好 1ms 被 `>0.001f` 挡掉。改为每帧差分 + EMA 低通 (自衰减、无卡值), 惯性效果恢复可用
+
+CAN / USB 稳定性 (mcp2515.c, main.c, CMakeLists.txt):
+
+30. `mcp2515_send` 完全非阻塞: 去掉 2ms 忙等, TXB0 忙则 abort 旧帧 (1kHz 力矩流最新值优先), 永不占用热路径
+31. 整帧 SPI 指令: 用 `LOAD TX BUFFER (0x40)` / `READ RX BUFFER (0x90/0x94)` 一次 CS 收发整帧, SPI 事务从 ~13 次降到 ~2 次; READ RX 靠 CS 拉高自动清 RXnIF
+32. **双核拆分**: CAN (init/poll/arm/torque) 全部移到 core1, USB + FFB 留在 core0。CAN 阻塞不再影响 USB 时序 (根治单核轮询互相拖累); MCP 初始化的 sleep 也不再卡在 USB 枚举窗口
+
+掉电恢复 (odrive_can.c, main.c):
+
+33. 电机离线检测: 心跳/编码器广播静默超过 250ms 即判离线 → 清 `closed_loop`/`encoder_valid`, 力矩门控到 0、1Hz 重发闭环。此前电机运行中掉电, `closed_loop` 会卡在 stale true, 恢复迟滞
+34. 掉电重连自动重设中心: `encoder_valid` false→true 的上升沿重新捕获盘中心。防止增量编码器重启后零点漂移 → 陈旧 offset 让弹簧**猛甩方向盘**
+35. 力矩三条件门控: 仅当 `!axis_error && closed_loop` 才输出力矩, 否则恒 0 (含离线超时窗口)
+
+> ⚠️ 30/31 (整帧 SPI 指令) 与 32-35 尚未实机验证, 请编译后上机确认 CAN 收发与掉电恢复行为。
 
 ⚠️ 待实机核实: `MAX_NM` 的量纲 — Set_Input_Torque 通常是减速箱**之前**的电机侧力矩, 4 Nm × 8:1 意味着盘端最高 ~32 Nm; 而如果手册的 "5 Nm 额定" 是输出侧, 电机侧额定仅 ~0.6 Nm。两种解读必有一错, 上机前先用低值 (如 `-DMAX_NM=0.5`) 验证。

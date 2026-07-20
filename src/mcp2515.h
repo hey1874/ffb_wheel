@@ -50,9 +50,10 @@
 #define MCP_WRITE        0x02
 #define MCP_BIT_MODIFY   0x05
 #define MCP_READ_STATUS  0xA0
-#define MCP_LOAD_TX0     0x40
+#define MCP_LOAD_TX0     0x40   /* LOAD TX BUFFER 0, start at TXB0SIDH */
 #define MCP_RTS_TX0      0x81
-#define MCP_READ_RX0     0x90
+#define MCP_READ_RX0     0x90   /* READ RX BUFFER 0, start at RXB0SIDH (auto-clears RX0IF) */
+#define MCP_READ_RX1     0x94   /* READ RX BUFFER 1, start at RXB1SIDH (auto-clears RX1IF) */
 
 /* Key registers */
 #define MCP_CANCTRL      0x0F

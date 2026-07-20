@@ -20,6 +20,7 @@
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/multicore.h"
 #include "hardware/timer.h"
 
 #include "ffb.h"
@@ -89,13 +90,14 @@
  * ODrive/encoder zero (which for an absolute encoder need not be the wheel's
  * mechanical center, and for an incremental one is just the power-on spot). */
 static float s_center_offset = 0.0f;
-static bool  s_centered      = false;
+/* Tracks the previous "encoder live" state so center is (re)captured on each
+ * rising edge — first boot and any motor power-cycle recovery. */
+static bool  s_enc_was_live  = false;
 
 /* Redefine the current wheel position as center. External linkage so a future
- * button handler can rebind it; also called once at startup. */
+ * button handler can rebind it; also called on each encoder-live rising edge. */
 void wheel_recenter(void) {
     s_center_offset = odrive_get_position();
-    s_centered = true;
 }
 
 /* Sign-corrected, center-referenced position: apply the center offset and
@@ -115,23 +117,30 @@ uint32_t ffb_get_tick_ms(void) {
 }
 
 /* ============================================================ */
-/* Platform override: torque output → ODrive CAN               */
+/* Platform override: torque output → shared command for core1  */
 /* ============================================================ */
 
+/* Latest engine torque (-32767..32767), produced by the FFB loop on core0 and
+ * consumed by the CAN loop on core1. A single aligned 16-bit store is atomic
+ * across cores on the RP2040, so no lock is needed; volatile forces the store
+ * to memory where core1 will see it. */
+static volatile int16_t g_torque_cmd = 0;
+
 void ffb_output_torque(int16_t torque) {
-    /* Map -32767..32767 to -MAX_NM..+MAX_NM (motor side); TORQUE_SIGN corrects
-     * the physical rotation direction (see polarity notes above). */
-    float nm = (float)torque * (MAX_NM / 32767.0f) * TORQUE_SIGN;
-    odrive_set_torque(ODRIVE_NODE_ID, nm);
+    /* Runs on core0. Just publish the command; core1 owns the CAN link and does
+     * the Nm/TORQUE_SIGN conversion next to the actual send, so nothing on the
+     * USB core ever touches SPI. */
+    g_torque_cmd = torque;
 }
 
 /* ============================================================ */
 /* Encoder reads → ODrive cached position/velocity             */
 /* ============================================================ */
 
-/* Track previous velocity for crude acceleration estimate. */
-static float s_prev_vel = 0.0f;
+/* Track previous velocity for a crude, EMA-smoothed acceleration estimate. */
+static float    s_prev_vel      = 0.0f;
 static uint32_t s_prev_vel_tick = 0;
+static int32_t  s_acc_filt      = 0;   /* lowpassed acceleration, ±10000 */
 
 static int32_t read_encoder_position(void) {
     float pos = enc_position();  /* motor turns, sign-corrected */
@@ -152,25 +161,33 @@ static int32_t read_encoder_velocity(void) {
 }
 
 static int32_t read_encoder_acceleration(void) {
-    /* Estimate acceleration from velocity delta. The FFB engine calls this
-     * at ~1 kHz, so dt ≈ 1 ms. We use the cached velocity; the Inertia
-     * effect is rarely used and this rough estimate is good enough. */
-    float vel = enc_velocity();  /* sign-corrected */
+    /* Estimate acceleration by differentiating the cached velocity. Two facts
+     * make a naive per-call diff useless: the engine calls this at ~1 kHz, but
+     * the velocity only refreshes when a CAN encoder frame arrives (~100 Hz on
+     * the GIM6010-8 default). So most calls see dv=0 and the ~10th sees the
+     * whole step over a 1 ms dt — a ~10x spike. We compute the raw diff every
+     * call (dt is >=1 ms here, so no divide-by-zero and no exactly-1 ms drop)
+     * and run it through an EMA: the spikes average out to the true rate, and a
+     * run of zero-diff samples decays the estimate back to zero on its own. */
+    float    vel = enc_velocity();  /* sign-corrected */
     uint32_t now = ffb_get_tick_ms();
-    int32_t acc = 0;
-    if (s_prev_vel_tick != 0 && now != s_prev_vel_tick) {
-        float dt = (float)(now - s_prev_vel_tick) / 1000.0f;
-        if (dt > 0.001f) {
-            float dv = (vel - s_prev_vel) / dt;  /* turns/s² */
-            /* Normalize: 800 turns/s² → 10000. */
-            acc = (int32_t)(dv * (10000.0f / 800.0f));
-            if (acc >  10000) acc =  10000;
-            if (acc < -10000) acc = -10000;
-        }
+    if (s_prev_vel_tick == 0) {
+        /* First call: seed the reference, no diff yet. */
+        s_prev_vel      = vel;
+        s_prev_vel_tick = now ? now : 1;   /* keep nonzero so we stay seeded */
+        return 0;
     }
-    s_prev_vel = vel;
-    s_prev_vel_tick = now;
-    return acc;
+    if (now != s_prev_vel_tick) {
+        float   dt = (float)(now - s_prev_vel_tick) / 1000.0f;
+        float   dv = (vel - s_prev_vel) / dt;              /* turns/s² */
+        int32_t a  = (int32_t)(dv * (10000.0f / 800.0f));  /* 800 turns/s² → 10000 */
+        if (a >  10000) a =  10000;
+        if (a < -10000) a = -10000;
+        s_acc_filt += (a - s_acc_filt) / 8;                /* lowpass, τ≈8 samples */
+        s_prev_vel      = vel;
+        s_prev_vel_tick = now;
+    }
+    return s_acc_filt;
 }
 
 /* Wheel axis position for the input report (int16_t, -32767..32767). */
@@ -223,7 +240,48 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id,
 }
 
 /* ============================================================ */
-/* Main loop                                                    */
+/* Core 1: CAN link (MCP2515 / ODrive)                          */
+/*                                                              */
+/* All MCP2515 / SPI / CAN traffic lives here so its blocking    */
+/* (init sleeps, per-frame SPI, arbitration) can never stall the */
+/* USB tud_task() loop on core0. Core0 ↔ core1 share only a few  */
+/* single-word values (g_torque_cmd out, s_odrv cache in).       */
+/* ============================================================ */
+
+static void core1_entry(void) {
+    /* MCP2515 init blocks for tens of ms (oscillator + mode changes) — fine
+     * here, it no longer sits in the USB enumeration window on core0. */
+    odrive_init(ODRIVE_NODE_ID);
+
+    uint32_t last_arm = 0;
+    uint32_t last_tx  = 0;
+
+    while (1) {
+        /* Poll incoming CAN frames (encoder estimates + heartbeat). */
+        odrive_poll();
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+
+        /* Re-arm at 1 Hz until the heartbeat confirms CLOSED_LOOP, so a
+         * motor powered up (or power-cycled) after the Pico still arms. */
+        if (!odrive_is_closed_loop() && now - last_arm >= 1000) {
+            last_arm = now;
+            odrive_request_closed_loop(ODRIVE_NODE_ID);
+        }
+
+        /* Stream the latest torque at ~1 kHz (also feeds the ODrive CAN
+         * watchdog). Map -32767..32767 → ±MAX_NM (motor side); TORQUE_SIGN
+         * corrects physical rotation direction (see polarity notes above). */
+        if (now != last_tx) {
+            last_tx = now;
+            float nm = (float)g_torque_cmd * (MAX_NM / 32767.0f) * TORQUE_SIGN;
+            odrive_set_torque(ODRIVE_NODE_ID, nm);
+        }
+    }
+}
+
+/* ============================================================ */
+/* Core 0: USB + FFB engine                                     */
 /* ============================================================ */
 
 int main(void) {
@@ -239,42 +297,40 @@ int main(void) {
     ffb_init();
     pedals_init();
 
-    /* Initialize MCP2515 + ODrive (puts motor in CLOSED_LOOP + TORQUE mode). */
-    odrive_init(ODRIVE_NODE_ID);
+    /* Hand the CAN link to core1 (MCP2515 init + torque stream + polling). */
+    multicore_launch_core1(core1_entry);
 
     uint32_t last_calc   = 0;
     uint32_t last_report = 0;
     uint32_t last_led    = 0;
-    uint32_t last_arm    = 0;
     bool     led_state   = false;
 
     while (1) {
         tud_task();  /* TinyUSB device task — must be called frequently */
 
-        /* Poll incoming CAN frames (encoder estimates + heartbeat). */
-        odrive_poll();
-
         uint32_t now = ffb_get_tick_ms();
 
-        /* Re-arm at 1 Hz until the heartbeat confirms CLOSED_LOOP, so a
-         * motor powered up (or power-cycled) after the Pico still arms. */
-        if (!odrive_is_closed_loop() && now - last_arm >= 1000) {
-            last_arm = now;
-            odrive_request_closed_loop(ODRIVE_NODE_ID);
-        }
-
-        /* Capture center once the encoder is live — deterministic power-on
-         * center that also survives an absolute encoder's nonzero boot value. */
-        if (WHEEL_CENTER_AT_BOOT && !s_centered && odrive_has_encoder()) {
+        /* (Re)capture center on every rising edge of "encoder live". This fires
+         * at first boot AND whenever the motor returns after a power-cycle —
+         * its encoder zero may have shifted, so re-centering here (before torque
+         * is re-enabled below) stops a stale offset from slamming the wheel.
+         * odrive_has_encoder() reads the core1-updated cache and drops to false
+         * on broadcast timeout. */
+        bool enc_live = odrive_has_encoder();
+        if (WHEEL_CENTER_AT_BOOT && enc_live && !s_enc_was_live) {
             wheel_recenter();
         }
+        s_enc_was_live = enc_live;
 
-        /* Effect engine at ~1 kHz. Reads encoder, sums effects, calls
-         * ffb_output_torque(). */
+        /* Effect engine at ~1 kHz. Reads encoder cache, sums effects, and
+         * publishes torque via ffb_output_torque() → g_torque_cmd (core1 sends). */
         if (now != last_calc) {
             last_calc = now;
-            if (odrive_axis_error() != 0) {
-                /* Motor faulted: command zero torque, don't fight it. */
+            /* Drive torque only when the motor is armed and healthy. A fault,
+             * or an axis that is not (or no longer) CLOSED_LOOP — including the
+             * offline timeout — commands zero rather than fighting or pushing
+             * against a stale center. */
+            if (odrive_axis_error() != 0 || !odrive_is_closed_loop()) {
                 ffb_output_torque(0);
             } else {
                 ffb_axis_metrics_t m = {

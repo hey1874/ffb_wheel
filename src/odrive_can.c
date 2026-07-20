@@ -20,7 +20,13 @@
  */
 #include "odrive_can.h"
 #include "mcp2515.h"
+#include "pico/time.h"
 #include <string.h>
+
+/* If the motor's periodic broadcasts go silent for this long, treat it as
+ * offline. The GIM6010-8 defaults are heartbeat 100 ms / encoder 10 ms, so
+ * 250 ms tolerates jitter and a couple of dropped frames without false trips. */
+#define ODRIVE_TIMEOUT_MS  250u
 
 /* ---- ODrive command IDs ---- */
 #define ODRV_CMD_HEARTBEAT          0x01
@@ -37,14 +43,19 @@
 #define ODRV_CTRL_TORQUE            1
 #define ODRV_INPUT_DIRECT           1
 
-/* ---- Cached state (updated by odrive_poll) ---- */
-static struct {
+/* ---- Cached state (written by odrive_poll on core1, read by the FFB loop on
+ * core0). Marked volatile so the compiler always re-reads shared SRAM; on the
+ * RP2040 (no data cache) aligned 32-bit fields are also torn-read-free across
+ * cores, so plain accessors need no locking. ---- */
+static volatile struct {
     float    position;       /* turns, motor side */
     float    velocity;       /* turns/s, motor side */
     uint32_t axis_state;     /* from heartbeat */
     uint32_t axis_error;     /* from heartbeat */
     bool     closed_loop;
-    bool     encoder_valid;  /* at least one Get_Encoder_Estimates received */
+    bool     encoder_valid;  /* at least one recent Get_Encoder_Estimates */
+    uint32_t last_hb_ms;     /* ms of last heartbeat (0 = never seen) */
+    uint32_t last_enc_ms;    /* ms of last encoder estimate (0 = never seen) */
 } s_odrv = {
     .position = 0.0f,
     .velocity = 0.0f,
@@ -52,6 +63,8 @@ static struct {
     .axis_error = 0,
     .closed_loop = false,
     .encoder_valid = false,
+    .last_hb_ms = 0,
+    .last_enc_ms = 0,
 };
 
 /* ---- Helpers ---- */
@@ -149,6 +162,7 @@ void odrive_poll(void) {
     uint16_t id;
     uint8_t  data[8];
     uint8_t  len;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
 
     /* Drain all pending frames in this poll cycle. */
     while (mcp2515_receive(&id, data, &len)) {
@@ -169,6 +183,7 @@ void odrive_poll(void) {
                     s_odrv.axis_error = unpack_u32(data);
                     s_odrv.axis_state = data[4];
                     s_odrv.closed_loop = (s_odrv.axis_state == ODRV_AXIS_CLOSED_LOOP);
+                    s_odrv.last_hb_ms = now ? now : 1;   /* keep nonzero */
                 }
                 break;
 
@@ -178,6 +193,7 @@ void odrive_poll(void) {
                     s_odrv.position = unpack_f32(data);
                     s_odrv.velocity = unpack_f32(data + 4);
                     s_odrv.encoder_valid = true;
+                    s_odrv.last_enc_ms = now ? now : 1;
                 }
                 break;
 
@@ -185,6 +201,20 @@ void odrive_poll(void) {
                 /* Ignore other frames (e.g. Get_Error, Get_Iq, etc.) */
                 break;
         }
+    }
+
+    /* Offline detection: if the broadcasts stop (motor powered off, cable
+     * pulled, bus error) invalidate the cached state. This gates torque off
+     * (closed_loop=false), re-fires the arm request, and — because encoder_valid
+     * drops — makes the app re-capture wheel center when the motor returns
+     * (its encoder zero may have shifted across a power cycle). Unsigned delta
+     * is wrap-safe. */
+    if (s_odrv.last_hb_ms && (uint32_t)(now - s_odrv.last_hb_ms) > ODRIVE_TIMEOUT_MS) {
+        s_odrv.closed_loop = false;
+        s_odrv.axis_state  = 0;
+    }
+    if (s_odrv.last_enc_ms && (uint32_t)(now - s_odrv.last_enc_ms) > ODRIVE_TIMEOUT_MS) {
+        s_odrv.encoder_valid = false;
     }
 }
 

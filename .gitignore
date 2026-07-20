@@ -7,6 +7,9 @@ build/
 *.dis
 *.map
 
+# ...but keep the released flashable image (RP2040 build)
+!firmware/*.uf2
+
 # Nested duplicate (from cp -r)
 ffb_wheel/
 
