@@ -104,7 +104,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint8_t status;           /* bitfield */
-    uint8_t effectBlockIndex; /* bit7 = playing, bit0..6 = id */
+    uint8_t effectBlockIndex; /* per descriptor: bit0 = effect playing, bits1..7 = block index */
 } ffb_pid_state_report_t;
 
 /* ---- Output report structures (no reportId byte) ---- */

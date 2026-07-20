@@ -21,6 +21,7 @@
 #include "odrive_can.h"
 #include "mcp2515.h"
 #include "pico/time.h"
+#include "hardware/sync.h"
 #include <string.h>
 
 /* If the motor's periodic broadcasts go silent for this long, treat it as
@@ -202,6 +203,12 @@ void odrive_poll(void) {
                 break;
         }
     }
+
+    /* Publish this poll's cache writes before core0's next read. The RP2040's
+     * Cortex-M0+ has no store buffer/cache and issues stores in program order,
+     * so this is belt-and-suspenders, but it documents the ordering the
+     * lock-free cross-core read (encoder_valid ⇒ position valid) relies on. */
+    __dmb();
 
     /* Offline detection: if the broadcasts stop (motor powered off, cable
      * pulled, bus error) invalidate the cached state. This gates torque off

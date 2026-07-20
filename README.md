@@ -1,281 +1,330 @@
 # FFB Wheel — RP2040 力反馈方向盘固件
 
-基于 RP2040 + MCP2515 CAN + SteadyWin GIM6010-8 电机的 USB HID 力反馈方向盘控制器固件。
+基于 **RP2040 + MCP2515 CAN + SteadyWin GIM6010-8 电机**的 USB HID 力反馈方向盘控制器固件。
 
-游戏会把本设备识别为真实的 USB HID FFB 设备（VID 0x1209 / PID 0xFFB0，与 OpenFFBoard 相同），无需虚拟 HID、无需安装驱动，DirectInput 原生识别。
+游戏把本设备识别为真实的 USB HID FFB 设备(VID `0x1209` / PID `0xFFB0`,与 OpenFFBoard 相同),**无需虚拟 HID、无需装驱动**,DirectInput 原生识别。
+
+---
+
+## 目录
+- [特性](#特性)
+- [架构](#架构)
+- [硬件与接线](#硬件与接线)
+- [编译与刷机](#编译与刷机)
+- [配置参考(`-D` 标志)](#配置参考-d-标志)
+- [上机流程(bring-up)](#上机流程bring-up)
+- [工作原理](#工作原理)
+- [排障](#排障)
+- [已知问题](#已知问题)
+- [Changelog](#changelog)
+- [文件结构](#文件结构)
+- [许可证与致谢](#许可证与致谢)
+
+---
+
+## 特性
+
+- **原生 DirectInput FFB**:11 种效果(恒力、斜坡、方波、正弦、三角、锯齿上/下、弹簧、阻尼、惯性、摩擦),40 效果槽位。
+- **6 轴**:方向盘 + 油门/刹车/离合 + 2 路备用。
+- **32 按钮**:通过 MCP23017 I²C 扩展(1–2 片),仅占 2 根线。
+- **3 路模拟踏板**:片上 12-bit ADC,过采样 + 低通 + 自动量程。
+- **双核架构**:USB 与 CAN 完全隔离,CAN 阻塞不影响 USB 时序。
+- **掉电恢复**:电机中途掉电/重连自动检测、重进闭环、重设中心。
+- **安全**:USB 掉线/挂起、电机故障、离线时自动清零力矩。
+
+---
 
 ## 架构
 
 ```
 游戏 (DirectInput)
   ↕ USB HID FFB (PID 1.0, Usage Page 0x0F)
-RP2040 (TinyUSB) — 双核
-  ├─ core0: USB (tud_task) + FFB 效果引擎 (ffb.c) — 11 种效果, 40 槽位池
-  │            └─ ffb_output_torque() → g_torque_cmd ─┐ (跨核单字, 无锁)
-  └─ core1: MCP2515 SPI-CAN (mcp2515.c) ←─────────────┘
-       ↕ CAN 500kbaud (ODrive 协议)
+RP2040 (TinyUSB) ── 双核 ──────────────────────────────────────┐
+  core0: USB (tud_task) + FFB 效果引擎 (ffb.c)                  │
+         + 输入报告(方向盘轴 / 踏板 ADC / 按钮 I²C)            │
+         └─ ffb_output_torque() → g_torque_cmd ──┐(跨核单字)   │
+  core1: MCP2515 SPI-CAN (mcp2515.c) ←───────────┘             │
+         odrive_poll() → s_odrv 缓存 ─────────────(跨核单字)───┘
+       ↕ CAN 500 kbaud (ODrive 协议)
 GIM6010-8 电机 (ODrive 固件 v0.5.16)
 ```
 
-> **双核隔离**: 所有 SPI/CAN 收发都在 core1, USB 独占 core0。CAN 再怎么阻塞/出错
-> 都不会拖住 `tud_task()`, USB 时序与 CAN 完全解耦。跨核只共享几个 32/16 位对齐单字
-> (RP2040 无数据缓存 → 天然无撕裂), 故无需加锁。
+**双核隔离**:所有 SPI/CAN 收发都在 **core1**,USB 独占 **core0**。CAN 再怎么阻塞/出错都拖不住 `tud_task()`。跨核只共享两个对齐单字——`g_torque_cmd`(core0→core1 力矩指令)和 `s_odrv`(core1→core0 编码器/状态缓存)。RP2040 无数据缓存 + 单写者 + 32/16 位对齐 → 天然无撕裂,**无需加锁**。
 
-## 硬件
+---
+
+## 硬件与接线
 
 | 部件 | 型号 | 说明 |
 |---|---|---|
-| MCU | RP2040 (Pico) | USB Full-Speed, ~1 kHz FFB 循环 |
-| CAN | MCP2515 SPI 模块 | 8 MHz 晶振, 500 kbaud |
-| 电机 | SteadyWin GIM6010-8 | 5 Nm 额定, 8:1 减速箱, ODrive CAN |
-| 接线 | SPI0: GP18 SCK, GP19 MOSI, GP16 MISO, GP17 CS | 可用 `-D` 标志覆盖 |
+| MCU | RP2040 (Pico) | USB Full-Speed,~1 kHz FFB 循环 |
+| CAN | MCP2515 SPI 模块 | 8 MHz 晶振,500 kbaud,轮询模式(不接 INT) |
+| 电机 | SteadyWin GIM6010-8 | 8:1 减速箱,ODrive CAN 协议 |
+| 按钮 | MCP23017 ×1–2(可选) | I²C GPIO 扩展,16/32 键 |
+| 踏板 | 电位器 ×3(可选) | 片上 ADC |
 
-## 编译
+### GPIO 引脚表(默认)
+
+| 功能 | 信号 | GPIO | 备注 |
+|---|---|---|---|
+| **MCP2515 (SPI0)** | SCK | GP18 | |
+| | MOSI (SI) | GP19 | |
+| | MISO (SO) | GP16 | |
+| | CS | GP17 | |
+| **MCP23017 按钮 (I2C0)** | SDA | GP20 | 需 ~4.7k 上拉到 3V3 |
+| | SCL | GP21 | 需 ~4.7k 上拉到 3V3 |
+| **踏板 (ADC)** | 油门 (ADC0) | GP26 | → HID 轴 Y |
+| | 刹车 (ADC1) | GP27 | → HID 轴 Z |
+| | 离合 (ADC2) | GP28 | → HID 轴 Rx |
+| **状态灯** | LED | GP25 | 板载;挂载后 1 Hz,未挂载 4 Hz 闪 |
+| **USB** | D+/D− | 专用 | 板载 USB 口 |
+
+> 空闲可做直连按钮/其他用途的 GPIO:GP0–15、GP22。所有引脚均可用 `-D` 覆盖(见配置参考)。
+
+### 接线安全 ⚠️
+
+- **CAN 必须共地**:CAN 是差分但**非隔离**。MCP2515 模块地要和电机 CAN 地连一根参考线,否则共模漂移会间歇丢帧/进 bus-off(见[排障](#排障))。
+- **CAN 终端 120Ω**:总线两端各一个,H–L 间总阻抗约 60Ω。
+- **ADC 脚不耐 5V**(RP2040 全脚、RP2350 的 GP26–29 均不耐):踏板电位器两端接 **3V3(OUT)** 和 GND,滑臂进 ADC;有源 0–5V 传感器要分压或用外部 ADC。
+- **MCP23017 若用 5V 供电,I²C 线不要直连 RP2040**(非 5V 耐受)。用 3V3 供电最省心。
+
+---
+
+## 编译与刷机
 
 ```bash
-# 一次性安装: ARM 工具链 + Pico SDK 依赖
-brew install arm-none-eabi-gcc cmake ninja
+# 一次性:ARM 工具链 + CMake + Ninja
+brew install arm-none-eabi-gcc cmake ninja      # macOS
+# Windows 用 ARM 官方 toolchain(含完整 newlib)+ Ninja
 
 # 编译
 cd ffb_wheel
 cmake -B build -G Ninja
 cmake --build build
 
-# 刷机: 按住 Pico 的 BOOTSEL, 拷贝 .uf2 文件
+# 刷机:按住 Pico 的 BOOTSEL,拷贝 .uf2
 cp build/ffb_wheel.uf2 /Volumes/RPI-RP2/
 ```
 
-> 注意: Homebrew 的 `arm-none-eabi-gcc` 不含 newlib，需下载 ARM 官方 toolchain 13.2.rel1（含完整 newlib），并设置 `PICO_TOOLCHAIN_PATH` 指向其安装目录。
+- Pico SDK 由 CMake 自动从 git 拉取(tag **2.1.1**)。
+- 预编译镜像见 `firmware/ffb_wheel.uf2`(RP2040,默认配置:踏板/按钮关闭)。
+- Homebrew 的 `arm-none-eabi-gcc` 不含 newlib;需 ARM 官方 toolchain 13.2.rel1,并设 `PICO_TOOLCHAIN_PATH`。
+- 编 RP2350:`cmake -B build2350 -G Ninja -DPICO_PLATFORM=rp2350 -DPICO_BOARD=pico2`。
+
+---
+
+## 配置参考(`-D` 标志)
+
+所有参数可在 `cmake` 命令行用 `-D` 覆盖,例如:
+
+```bash
+cmake -B build -G Ninja -DMAX_NM=0.5 -DBUTTON_CHIPS=1 -DPEDAL_COUNT=3
+```
+
+> ✅ CMakeLists 会把这些 `-D` 转发给编译器才真正生效。**标注"源码"的项** 是外设实例/引脚列表,`-D` 传递不便,请直接改对应头文件。
+
+### FFB / 电机
+
+| 标志 | 默认 | 说明 |
+|---|---|---|
+| `MAX_NM` | `4.0` | FFB 满量程(±32767)对应的电机侧力矩(Nm)。**首次上机务必先设 0.5**,见[已知问题](#已知问题) |
+| `WHEEL_MAX_TURNS` | `2.0` | 方向盘 ±圈数(2.0 = ±720°) |
+| `ENCODER_SIGN` | `+1` | 编码器方向(方向盘转向反了改 `-1`) |
+| `TORQUE_SIGN` | `-1` | 力矩方向(BL72 默认 `-1`,弹簧反向则改 `+1`) |
+| `WHEEL_CENTER_AT_BOOT` | `1` | 编码器每次就绪(开机/掉电重连)时把当前位置设为中心;`0` 用 ODrive 编码器零点 |
+| `GEAR_RATIO` / `VEL_NORM_TURNS` | `8.0` / `80.0` | 减速比 / 速度归一化(源码常量) |
+
+### CAN / MCP2515
+
+| 标志 | 默认 | 说明 |
+|---|---|---|
+| `ODRIVE_NODE_ID` | `1` | 电机 CAN 节点 ID(CyberBeast BL72 出厂默认 1) |
+| `MCP_BAUD` | `500000` | CAN 波特率 |
+| `MCP_OSC_HZ` | `8000000` | MCP2515 晶振 |
+| `MCP_SPI_HZ` | `5000000` | SPI 时钟(≤10 MHz) |
+| `MCP_SCK_PIN` / `MCP_MOSI_PIN` / `MCP_MISO_PIN` / `MCP_CS_PIN` | `18/19/16/17` | SPI 引脚 |
+| `MCP_SPI` | `spi0` | SPI 实例(源码) |
+
+### 踏板
+
+| 标志 | 默认 | 说明 |
+|---|---|---|
+| `PEDAL_COUNT` | `0` | 模拟踏板数量(0=禁用,接了改 3) |
+| `PEDAL_ADC_BASE_GPIO` | `26` | ADC 通道 0 的 GPIO |
+| `PEDAL_INVERT_MASK` | `0x00` | 反向位掩码(bit i = 第 i 路反向) |
+
+### 按钮
+
+| 标志 | 默认 | 说明 |
+|---|---|---|
+| `BUTTON_CHIPS` | `0` | MCP23017 芯片数(0=禁用,1=16 键,2=32 键) |
+| `BUTTON_ADDR0` / `BUTTON_ADDR1` | `0x20` / `0x21` | 两片的 I²C 地址(A2/A1/A0 脚设定) |
+| `BUTTON_SDA_PIN` / `BUTTON_SCL_PIN` | `20` / `21` | I²C 引脚 |
+| `BUTTON_I2C_HZ` | `400000` | I²C 时钟 |
+| `BUTTON_DEBOUNCE` | `3` | 去抖采样数(~250 Hz 扫描,3 ≈ 12 ms) |
+| `BUTTON_I2C` | `i2c0` | I²C 实例(源码) |
+| `BUTTON_GPIOS` | — | 仅直连 GPIO 版用;当前为 MCP23017 版(源码) |
+
+---
+
+## 上机流程(bring-up)
+
+**首次上机务必按顺序做,不要一上来就用默认 `MAX_NM=4.0`。**
+
+### 1. 低力矩起步 + 验证 `MAX_NM` 量纲 ⚠️
+`Set_Input_Torque` 一般是减速箱**之前**的电机侧力矩。`4.0 × 8:1` = 盘端最高约 **32 Nm**(足以伤手腕)。**先 `-DMAX_NM=0.5` 编译**,对照手册/测电流确认量纲后再加大。
+
+### 2. 极性校准(`ENCODER_SIGN` / `TORQUE_SIGN`)
+1. **先定 `ENCODER_SIGN`**:把盘向右转,看游戏里轴是否同向,反了就 `-1`(它同时决定游戏轴方向和弹簧参考)。
+2. **再定 `TORQUE_SIGN`**:开居中弹簧,若盘被**推离中心/失控**而非回中,就 `-1`。低力矩下做最安全。
+> 恒力方向也要单独验一次,见[已知问题](#已知问题)。
+
+### 3. 配置 ODrive 编码器广播速率
+固件靠电机主动广播的 `Get_Encoder_Estimates (0x09)` 拿位置/速度。**广播关闭 → 轴不动、弹簧/阻尼失效;太慢 → 1kHz 弹簧拿陈旧位置会发涩发抖。** 在 ODrive 侧设到 ~1ms(`axis0.config.can.encoder_msg_rate_ms = 1`)。
+
+### 3.1 CyberBeast BL72 (GIM6010-8) 专项
+- **CAN node_id 出厂 = 1**:编译时 `-DODRIVE_NODE_ID=1`(默认已是)。node_id 写死,`sc` 会从闪存恢复默认。
+- **CAN 广播默认开**:出厂 `heartbeat=100ms`、`encoder=10ms`,无需额外配置。
+- **上电顺序**:随意——固件有心跳超时+1Hz 重试,谁先谁后都能自恢复(见[排障](#排障))。
+- **调试完拔掉电机 USB-C**:同时连接某些情况会 CAN 间歇丢帧。
+
+### 4. 开启 ODrive CAN watchdog(安全)
+`axis0.config.enable_watchdog = True`,`watchdog_timeout ≈ 0.05`。本固件 1kHz 力矩流持续喂狗;固件一停,狗超时 → 电机进 IDLE,不会顶死盘。
+
+### 5. 方向盘中心(软零点)
+中心是软零点:`WHEEL_CENTER_AT_BOOT=1`(默认)时,固件在**每次编码器就绪的瞬间**(开机或电机掉电重连)把当前位置捕获为中心。
+- 上电前/上电时把盘摆到机械正中即可。
+- 对**绝对编码器**尤其有用(其绝对零点通常不是盘正中)。
+- 固件导出 `wheel_recenter()`,可绑按钮做"回中键"。
+
+### 6. 踏板标定
+插上踏板后,**每个踩到底再松开一次**,自动量程即完成标定。
+
+### 7. 按钮
+接 MCP23017,`-DBUTTON_CHIPS=1`(16 键)或 `2`(32 键);按钮接芯片 GPIO ↔ GND。
+
+---
+
+## 工作原理
+
+### USB FFB 协议
+HID 描述符(源自 VNWheel,MIT)声明一个 PID 1.0 设备:
+- 32 按钮 + 6 轴(int16)输入报告。
+- 11 种效果、40 槽位、设备管理池。
+- OUT(EP1)+ IN(EP81)端点,低延迟 FFB 报告。
+
+### 效果引擎(ffb.c,core0)
+- `ffb_on_set_report()` — 处理所有 Set Effect/Condition/Periodic、Effect Operation、Device Control 等。
+- `ffb_calculate()` — ~1 kHz:读编码器度量,累加活动效果,应用包络/增益/方向,限幅到 ±10000 后换算到 ±32767,调 `ffb_output_torque()`。
+- 条件效果(弹簧/阻尼/惯性/摩擦)用归一化到 -10000..10000 的轴度量(匹配 PID 描述符)。
+
+### ODrive CAN(odrive_can.c,core1)
+- `odrive_request_closed_loop()` — Set_Controller_Mode(TORQUE, DIRECT) + Set_Axis_State(CLOSED_LOOP) + 清零力矩。
+- `odrive_set_torque()` — float Nm 打包为 CAN `0x0E` 帧。
+- `odrive_poll()` — 排空 RX,缓存 pos/vel(`0x09`)、追踪闭环/故障(`0x01` 心跳);**心跳/编码器静默 >250ms 判离线**。
+- 力矩换算:引擎 ±32767 → Nm 经 `MAX_NM`,`TORQUE_SIGN` 修正方向。
+
+### 编码器归一化(main.c,core0)
+- FFB 度量:电机圈数 → -10000..10000(弹簧/阻尼/摩擦/惯性)。
+- 方向盘报告:电机圈数 → -32767..32767(游戏读取)。
+- 惯性加速度:速度差分 + EMA 低通(粗略)。
+
+### 踏板(pedals.c,core0)
+片上 12-bit ADC 读三路,8 次过采样 + 指数低通 + OpenFFBoard 式自动量程,填入 Y/Z/Rx。
+
+### 按钮(buttons.c,core0)
+MCP23017 I²C 读 16/32 输入(active-low + 片内上拉),每键 ~12ms 去抖。**I²C 全部带超时**,芯片没接/总线故障降级为"无按钮",不阻塞 USB。
+
+---
+
+## 排障
+
+### USB 偶发掉线
+按可能性排查:
+1. **CAN 未共地(最常见)**:MCP2515 地 ↔ 电机 CAN 地加一根参考线。无共地 → 共模漂移 → CAN 错误/bus-off → 即使有非阻塞 send 也可能间歇性影响;**掉线是否总在电机大力矩瞬间?** 是则一定是电气问题。
+2. **CAN 终端**:量 H–L 断电阻值应约 60Ω。
+3. **供电**:电机与 Pico 分开供电、单点共地;Pico 电源就近加电容;USB 线加磁环、用带供电 Hub。
+4. **固件已做的硬化**:`mcp2515_send` 非阻塞、整帧 SPI 指令、双核隔离——CAN 侧问题已尽量不传导到 USB。
+
+### CAN 丢帧 / 电机无响应
+- 确认 `ODRIVE_NODE_ID` 与电机一致(BL72 = 1)。
+- 确认共地 + 终端(同上)。
+- 确认 ODrive 编码器广播已开(否则轴不动)。
+- LED 常闪但游戏无力:检查是否进闭环(心跳 state=8)、`axis_error` 是否非零。
+
+### 上电顺序 / 掉电恢复
+固件对顺序**无要求**:
+- 电机后上电 → 1Hz 重发闭环自动 arm。
+- 电机运行中掉电 → 250ms 内判离线,清闭环、力矩归零;回来后自动重进闭环 + 重设中心(防增量编码器零点漂移甩盘)。
+- Pico 复位 → 重发闭环并先清零力矩;配合 ODrive watchdog 兜底。
+- 固件卡死(core0/FFB)→ core1 在 50ms 内改发 0 力矩,盘变软(不会保持力);与 ODrive watchdog 构成双保险。
+
+---
+
+## 已知问题
+
+1. **`MAX_NM` = 输出(盘端)力矩** — GIM6010-8 的 ODrive `torque_constant` 是**输出侧**配置的,`Set_Input_Torque` 单位就是盘端 Nm(8:1 减速已折算进去),固件按原值下发、**不再除以减速比**。默认 `4.0` ≈ 额定输出力矩,安全。
+   > ⚠️ 万一某台电机的 `torque_constant` 其实按电机侧配置,`MAX_NM=4.0` 会在盘端放大 8 倍(~32 Nm,伤手腕)。**首次上机花 10 秒验一次**:发一个小力矩,感受手感 / 测电机电流,确认无误再上满量程。
+
+2. **`calc_condition` 负号 / 恒力方向待验** ⚠️ — 当前 condition 公式无负号、靠 `TORQUE_SIGN=-1` 让弹簧回中(欧卡实测 OK)。但去负号 + 全局 `TORQUE_SIGN` 在数学上**无法让弹簧与恒力同时正确**:弹簧对了,恒力/斜坡/带方向的周期力可能整体反向。**恒力主导的竞速游戏(AC/iRacing/rF2)请单独验一次方向**;若反,恢复 `calc_condition` 负号并用恒力游戏重标 `TORQUE_SIGN`。
+
+3. **待实机确认(逻辑已核对,未上硬件)**:MCP2515 整帧 SPI 指令(字节序/自动清标志)、MCP23017 I²C(寄存器/active-low)、双核 + 掉电恢复整链路。
+
+---
+
+## Changelog
+
+### 2026-07-20 独立审查修复(第二轮)
+- **失效保护(双核回归修复)**:双核后即使 core0(FFB)卡死,core1 仍会一直重发最后力矩并喂 ODrive 看门狗 → 盘永久保持力。现 core0 每圈打存活时间戳,core1 发现 >50ms 未推进即发 0。
+- **掉电重连甩盘窗口收窄**:力矩门控加入 `odrive_has_encoder()`,确保编码器重新就绪(并已重设中心)之前不输出力矩,堵住"心跳先于编码器帧到达"的竞态。
+- **按钮 I²C 超时** 1000µs → 300µs:芯片卡死时对 core0 输入报告的阻塞封顶更小。
+- **跨核内存屏障**:`odrive_poll` 末尾加 `__dmb()`,显式化 core0 无锁读所依赖的写入顺序(M0+ 本就顺序,属文档化)。
+- Inertia EMA 的 `/8` 改为四舍五入,消除小残差死区;修正 PID State 报告 `effectBlockIndex` 注释(与描述符位序一致)。
+
+### 2026-07-20 稳定性 / 掉电恢复 / 按钮
+- **双核拆分**:CAN(init/poll/arm/torque)全移到 core1,USB + FFB 留 core0;CAN 阻塞不再影响 USB;MCP 初始化 sleep 不再卡枚举窗口。
+- `mcp2515_send` **完全非阻塞**(去 2ms 忙等,TXB0 忙则 abort,最新力矩优先)。
+- **整帧 SPI 指令**:LOAD TX / READ RX BUFFER,单次 CS 收发,事务 ~13 → ~2;READ RX 自动清 RXnIF。
+- **电机离线检测**:心跳/编码器静默 >250ms 判离线,清闭环/编码器有效、力矩归零、重发 arm。
+- **掉电重连自动重设中心**:`encoder_valid` 上升沿重捕获中心(防零点漂移甩盘);力矩门控 `!axis_error && closed_loop`。
+- **Inertia 加速度**修复(此前 `>0.001f` + 1ms 量化恒为 0):每帧差分 + EMA。
+- **`-D` 调优标志此前全失效**(从未转发给编译器):加 CMake foreach 转发,MAX_NM/TORQUE_SIGN/PEDAL_COUNT/BUTTON_CHIPS 等才真正可覆盖。
+- **按钮支持**:HID 按钮 8 → 32;新增 `buttons.c` 走 MCP23017 I²C(1–2 片,带超时去抖)。
+- 修 `PEDAL_COUNT=0` 零长数组告警;README / main.c 头注释同步双核。
+
+### 2026-07(前期代码审查)
+效果引擎、极性、CAN 驱动、USB 安全等 28 项修复,详见 git 历史。关键项:
+- `calc_condition` 系数范围 32767 → 10000(否则弹簧只有 9% 力度)。
+- magnitude/包络标度统一到 ±10000;Envelope/Periodic 的 32 位字段修正;相位单位 0..35999;无限时长认 0xFFFF。
+- One-Shot TX + RXB1 补读;心跳单字节 state 解析;`odrive_init` 非阻塞。
+- USB 掉线/挂起、`axis_error` 非零时清零力矩。
+
+---
 
 ## 文件结构
 
 ```
 ffb_wheel/
-├── CMakeLists.txt              # Pico-SDK 构建, 链接 TinyUSB + hardware_spi
-├── pico_sdk_import.cmake       # Pico SDK 导入脚本 (随 SDK 下载)
+├── CMakeLists.txt              # Pico-SDK 构建 + -D 调优转发
+├── pico_sdk_import.cmake       # Pico SDK 导入脚本
+├── firmware/ffb_wheel.uf2      # 预编译镜像(RP2040,默认配置)
 └── src/
-    ├── main.c                  # 入口, 主循环, ODrive 集成
-    ├── ffb.h                   # FFB 引擎接口
-    ├── ffb.c                   # 效果引擎: 11 种效果, 报告分发
-    ├── ffb_types.h             # 报告结构体, 常量 (无 reportId 字节)
-    ├── ffb_descriptors.h       # 完整 HID FFB 报告描述符 (源自 VNWheel)
-    ├── tusb_config.h           # TinyUSB 配置 (RP2040, 1 个 HID 接口)
+    ├── main.c                  # 入口;core0=USB+FFB,core1=CAN
+    ├── ffb.{h,c}               # 效果引擎:11 种效果、报告分发
+    ├── ffb_types.h             # 报告结构体、常量
+    ├── ffb_descriptors.h       # HID FFB 报告描述符(源自 VNWheel)
+    ├── tusb_config.h           # TinyUSB 配置
     ├── usb_descriptors.c       # USB 设备/配置/字符串描述符
-    ├── mcp2515.h               # MCP2515 SPI-CAN 驱动头文件
-    ├── mcp2515.c               # MCP2515 实现 (轮询模式)
-    ├── odrive_can.h            # ODrive CAN 协议 API
-    ├── odrive_can.c            # ODrive 实现 (力矩 + 编码器轮询)
-    ├── pedals.h                # 模拟踏板接口 (油门/刹车/离合)
-    ├── pedals.c                # 片上 ADC 读踏板, 过采样+低通+自动量程
-    ├── buttons.h               # 按钮接口 (MCP23017 I²C 扩展, 最多 32 键)
-    └── buttons.c               # I²C 读扩展芯片, 去抖 (带超时, 不阻塞 USB)
+    ├── mcp2515.{h,c}           # MCP2515 SPI-CAN 驱动(轮询,整帧指令)
+    ├── odrive_can.{h,c}        # ODrive CAN 协议(力矩 + 编码器 + 离线检测)
+    ├── pedals.{h,c}            # 模拟踏板(片上 ADC)
+    └── buttons.{h,c}           # 按钮(MCP23017 I²C,最多 32 键)
 ```
 
-## 工作原理
+---
 
-### USB FFB 协议
-HID 描述符（源自 VNWheel, MIT 许可证）声明了一个 PID 1.0 Physical Interface Device，包含:
-- 8 按钮 + 6 轴 (int16_t) 输入报告
-- 11 种 FFB 效果: 恒力、斜坡、方波、正弦、三角、锯齿上/下、弹簧、阻尼、惯性、摩擦
-- 40 个效果槽位, 设备管理的池
-- OUT 端点 (EP1) + IN 端点 (EP1), 低延迟 FFB 报告
+## 许可证与致谢
 
-### 效果引擎 (ffb.c)
-- `ffb_on_set_report()` — 处理所有 SET_REPORT/OUT 端点报告 (Set Effect, Set Condition, Set Periodic, Effect Operation, Block Free, Device Control 等)
-- `ffb_on_get_report()` — 处理 GET_REPORT 请求 (Block Load 和 PID Pool feature 报告)
-- `ffb_calculate()` — 1 kHz 节拍: 读取编码器度量, 累加活动效果, 应用包络/增益, 限幅到 ±32767, 调用 `ffb_output_torque()`
-- 条件效果 (Spring/Damper/Friction/Inertia) 使用归一化到 -10000..10000 的轴度量 (匹配 PID 描述符)
-
-### ODrive CAN (odrive_can.c)
-- `odrive_init()` — 初始化 MCP2515 并发送首次 Set_Controller_Mode(1=TORQUE, 1=DIRECT) + Set_Axis_State(8=CLOSED_LOOP), 不阻塞; 主循环每秒重发直到心跳确认 CLOSED_LOOP(电机后上电也能自动进闭环)
-- `odrive_set_torque()` — 将 float Nm 打包为 CAN 0x0E 帧
-- `odrive_poll()` — 排空 RX 缓冲, 缓存 pos/vel (来自 0x09 广播), 追踪 CLOSED_LOOP (来自 0x01 心跳)
-- `odrive_get_position/velocity()` — 返回缓存的电机侧圈数和圈/秒
-
-### 力矩换算
-FFB 引擎输出 (-32767..32767) → Nm, 通过 `MAX_NM` (默认 4.0)。编译时调整:
-```bash
-cmake -B build -G Ninja -DMAX_NM=3.0  # 更柔和的方向盘
-```
-
-### 编码器归一化
-- FFB 度量: 电机圈数 → -10000..10000 (用于 Spring/Damper/Friction/Inertia)
-- 方向盘报告: 电机圈数 → -32767..32767 (int16_t, 供游戏读取)
-- 可配置: `-DWHEEL_MAX_TURNS=2.5` 实现 ±900° 方向盘
-
-## 踏板 (油门 / 刹车 / 离合)
-
-HID 描述符本就声明了 6 个轴 (X/Y/Z/Rx/Ry/Rz), 现在 `pedals.c` 用 RP2040/RP2350
-片上 12-bit ADC 读三路模拟踏板, 填入 Y (油门)、Z (刹车)、Rx (离合):
-
-- 默认引脚: **ADC0/1/2 = GP26/GP27/GP28**
-- 每路做 8 次过采样 + 指数低通降噪, 并做 OpenFFBoard 式**自动量程** —— 第一次踩满
-  全行程后即完成标定, 释放端映射到轴最小值
-- 编译期可调: `-DPEDAL_COUNT=2` (只用两路)、`-DPEDAL_INVERT_MASK=0x2` (第 2 路反向,
-  用于踩下时电压下降的接线)
-
-> ⚠️ **接线安全 — ADC 脚不耐 5V** (RP2040 完全不耐; RP2350 的 5V 容忍**不含**
-> GP26-29 这几个 ADC 脚)。
-> - **被动电位器踏板**: 电位器两端接 **3V3(OUT)** 和 GND, 滑臂进 ADC 脚 —— **不要接 5V**。
-> - **有源 0-5V 传感器**: 分压到 0-3.3V, 或外接 ADS1115 (I²C), 切勿把 5V 直连 ADC 脚。
-> - 不接的踏板务必同时调低 `PEDAL_COUNT`; 悬空的 ADC 脚会因噪声被自动量程误标定。
-
-## 按钮 (方向盘 / 按钮盒)
-
-HID 描述符声明了 **32 个按钮**。`buttons.c` 用 **MCP23017 I²C GPIO 扩展芯片**读取,
-一片 16 键、两片 32 键,只占 2 根 I²C 线(SDA/SCL),接线远少于直连 GPIO:
-
-- 默认 **禁用** (`BUTTON_CHIPS=0`); 接了芯片编译时设 `-DBUTTON_CHIPS=1`(或 2)。
-- 默认 I²C: **i2c0 = GP20(SDA) / GP21(SCL)**; 两片地址 `0x20` / `0x21`(由芯片 A2/A1/A0 脚设定)。
-- 按钮接在 MCP23017 的 GPIO 脚与 **GND** 之间(片内上拉已开,无需外部电阻); I²C 线建议各加 ~4.7k 上拉到 3V3。
-- 每键做 ~12ms 去抖(在 ~250Hz 输入报告节拍上扫描)。
-- **I²C 全部带超时**: 芯片没接/无响应时降级为"无按钮", 绝不阻塞 core0 的 USB 循环。
-
-> ⚠️ MCP23017 若用 5V 供电, 其 I²C 线**不要**直连 RP2040(非 5V 耐受)。用 3V3 供电最省心。
-> 要超过 32 键需改 HID 描述符位宽(DirectInput 上限 128)。
-
-## 游戏兼容性
-使用 OpenFFBoard 的 VID/PID (0x1209/0xFFB0)，因此按 ID 注册设备的游戏 (Dirt, EA WRC) 无需编辑 XML 即可识别本方向盘。兼容任何 DirectInput FFB 游戏: Assetto Corsa, iRacing, rFactor 2, BeamNG, Forza 等。
-
-## 调优参数
-所有关键参数均可用 `-D` 覆盖:
-
-| 标志 | 默认值 | 说明 |
-|---|---|---|
-| `MAX_NM` | 4.0 | FFB 满量程对应的电机侧力矩 (Nm) |
-| `WHEEL_MAX_TURNS` | 2.0 | ±圈数输出 (2.0 = ±720°) |
-| `ENCODER_SIGN` | +1 | 编码器方向 (方向盘转向反了改 -1) |
-| `TORQUE_SIGN` | -1 | 力矩方向 (BL72 默认 -1, 若弹簧反向则改 +1) |
-| `WHEEL_CENTER_AT_BOOT` | 1 | 编码器每次就绪(开机 / 电机掉电重连)时把当前位置设为中心 (0 = 用 ODrive 编码器零点) |
-| `ODRIVE_NODE_ID` | 1 | 电机 CAN 节点 ID (CyberBeast BL72 出厂默认 1) |
-| `MCP_BAUD` | 500000 | CAN 波特率 |
-| `MCP_SPI_HZ` | 5000000 | MCP2515 的 SPI 时钟 |
-| `PEDAL_COUNT` | 0 | 模拟踏板数量 (ADC 通道数; 默认禁用, 接了踏板改 3) |
-| `PEDAL_INVERT_MASK` | 0x00 | 踏板反向位掩码 (bit i = 第 i 路反向) |
-| `BUTTON_CHIPS` | 0 | MCP23017 按钮扩展芯片数 (0=禁用, 1=16 键, 2=32 键) |
-| `BUTTON_SDA_PIN` / `BUTTON_SCL_PIN` | 20 / 21 | I²C 引脚 (默认 i2c0) |
-| `BUTTON_ADDR0` / `BUTTON_ADDR1` | 0x20 / 0x21 | 两片 MCP23017 的 I²C 地址 |
-
-> 这些 `-D` 标志现在通过 CMakeLists 转发到编译器才真正生效 (见修复记录 36)。
-
-## 上机调试 (bring-up)
-
-**首次上机务必按顺序做,不要一上来就用默认 `MAX_NM=4.0`。**
-
-### 1. 低力矩起步 + 验证 `MAX_NM` 量纲 ⚠️
-`Set_Input_Torque` 一般是减速箱**之前**的电机侧力矩,`4.0 × 8:1` 意味着盘端最高约
-**32 Nm**(足以伤手腕);若手册"5 Nm 额定"指的是输出侧,则电机侧仅 ~0.6 Nm、`4.0`
-反而超载 6 倍。**先用 `-DMAX_NM=0.5` 编译**,对照手册 / 测电流确认量纲后再逐步加大。
-
-### 2. 极性校准 (`ENCODER_SIGN` / `TORQUE_SIGN`)
-电机/编码器的接线决定了两个固件无法自知的物理方向,弄反了弹簧会**把盘甩到底而非回中**:
-1. **先定 `ENCODER_SIGN`**:把盘向右转,看游戏里轴是否同向。反了就 `-DENCODER_SIGN=-1`
-   (这同时决定游戏轴方向和弹簧参考,先把它弄对)。
-2. **再定 `TORQUE_SIGN`**:开一个居中弹簧,如果盘被**推离中心 / 失控**而不是回中,
-   就 `-DTORQUE_SIGN=-1`。
-低力矩下做这一步最安全。
-
-### 3. 配置 ODrive 编码器广播速率(否则没手感)
-本固件靠电机主动广播的 `Get_Encoder_Estimates (0x09)` 拿位置/速度。
-**若该广播关闭,`odrive_get_position` 恒为 0 → 方向盘轴不动、弹簧/阻尼完全失效;
-若速率太慢(默认常为 ~10-100ms),1kHz 的弹簧/阻尼拿陈旧位置计算会发涩发抖。**
-在 ODrive 侧把编码器广播设到 ~1ms(如 `axis0.config.can.encoder_msg_rate_ms = 1`)。
-
-### 3.1. CyberBeast BL72 (GIM6010-8) 上机注意
-- **CAN node_id 出厂默认为 1**: 编译时务必 `-DODRIVE_NODE_ID=1` 匹配电机。电机侧 node_id 写死无法通过 ASCII 修改，`sc` 命令会从闪存恢复默认值。
-- **CAN 广播默认开启**: 出厂的 `heartbeat_rate_ms=100` 和 `encoder_rate_ms=10` 已打开, 无需额外配置。
-- **上电顺序**: 电机先上电, RP2040 后上电。固件启动时初始化 MCP2515, 如果电机没电 CAN 总线无设备。
-- **拔掉电机 USB 有助于 CAN 稳定**: 实际测试发现某些情况下同时连接会导致 CAN 帧间歇丢失, 建议调试完成后拔掉电机 USB-C。
-
-### 4. 开启 ODrive CAN watchdog(安全)
-固件若卡死/崩溃,ODrive 会保持最后一次力矩,盘可能被顶死。开启轴看门狗
-(`axis0.config.enable_watchdog = True`, `watchdog_timeout ≈ 0.05`),本固件 1kHz 的
-力矩流会持续喂狗;固件一停,狗超时 → 电机报错进 IDLE。
-
-### 5. 方向盘中心 (回中/找零)
-中心不再是"ODrive 编码器的零点",而是一个软零点:`WHEEL_CENTER_AT_BOOT=1`(默认)时,
-固件在**开机收到第一帧编码器数据后**,把当前位置捕获为中心。
-- **用法**:上电前 / 上电时把方向盘摆到机械正中即可,弹簧会以此为参考回中。
-- 对**绝对编码器**尤其有用 —— 它的绝对零点通常不是方向盘正中,软零点解决了这个错位。
-- 想随时重设中心,固件导出了 `wheel_recenter()`,接了按钮后可绑定为"回中键"。
-- `WHEEL_CENTER_AT_BOOT=0` 则退回用编码器自身零点(不推荐)。
-- 注意:这不是靠限位块的物理 homing;若你的机构有硬限位、想要真正的机械中点自动标定,
-  可另外做限位 homing(告诉我即可)。
-
-### 6. 踏板标定
-插上踏板后,**每个踏板踩到底再松开一次**,自动量程即完成标定(标定前读"释放"值)。
-
-## 已知问题与修复记录
-
-开发过程中修复的关键 bug:
-
-1. `mcp2515.c` 使用 `MCP_SPI_HZ` 但头文件未定义 → 添加 5MHz 默认值
-2. `calc_condition` 除以 32767, 但描述符条件系数范围是 -10000..10000 → 改除 10000, 否则 Spring/Damper 只有 9% 力度
-3. `get_next_free_effect` 先存 id 再搜索, 导致重复分配在用槽位 → 改为先搜再分配
-4. `ffb.c` 用 `HID_REPORT_TYPE_FEATURE` 但未 include tusb.h → 在 `ffb_types.h` 加 `FFB_REPORT_TYPE_*` 常量保持 USB 栈无关
-5. `odrive_init` 用循环计数器做超时 → 改用 `pico/time.h` 真定时器 500ms
-6. `tusb_config.h` 不能 `#include tusb_options.h` (应为 `tusb_option.h`, 但实际不需要 include, SDK 自动处理)
-7. `CFG_TUSB_MCU`/`CFG_TUSB_OS` 不能在 `tusb_config.h` 里定义, SDK build 系统 `-D` 传入
-8. `BOARD_TUD_RHPORT` 不存在, 用 `0` 代替
-9. `mcp2515.h` 缺 `TXB0SIDL`/`RXB0SIDL` 寄存器定义 → 补上
-10. `usb_descriptors.c` 需 include `bsp/board_api.h` 才能用 `board_usb_get_serial` (static inline)
-
-### 2026-07 代码审查修复
-
-效果引擎 (ffb.c / ffb_types.h):
-
-11. `calc_condition` 负系数错误取反 → 弹簧两侧输出同向力, 方向盘会猛拉向一边; 按 PID 规范公式去掉负号
-    > **2026-07-19 实机验证: `calc_condition` 公式 `f = (metric - cp) * coeff / 10000` 本身正确，
-    > 无需加负号。弹簧方向由 `TORQUE_SIGN` 校准。CyberBeast BL72 电机正扭矩 = CW 旋转，
-    > 需设 `TORQUE_SIGN=-1` 使正系数产生回中力。已在 `main.c` 中设为默认值。
-12. 力度标度统一: 描述符 magnitude 范围是 ±10000, 引擎却按 ±32767 满量程 → 恒定力只有 30%; 周期效果的 magnitude 还在包络里被二次相乘 (≈9%)。现在全部效果在 ±10000 单位下计算, `ffb_calculate` 末端统一换算到 ±32767
-13. Set Envelope 的 attackTime/fadeTime 描述符是 32 位字段, 结构体误用 uint16 → fadeTime 永远读到 0; Set Periodic 的 period 同理改为 uint32
-14. 相位单位: 描述符是 0..35999 (0.01°), 代码原按 0..255 处理
-15. 无限时长: Windows 用 0xFFFF (Null 值) 表示无限, 原代码只认 0x7FFF → 无限效果 65 秒后消失。现在 0 和 ≥0x7FFF 都视为无限
-16. 周期 offset 范围 ±10000, 去掉遗留自 8 位描述符的 `offset*2`
-17. Effect Operation 的 loopCount 不再原地改写 duration (重复 Start 会翻倍), 改为独立的 totalDuration (uint32, 防溢出)
-18. 恒定力/斜坡力也应用包络 (PID 规范要求); 斜坡按循环迭代重新爬升
-19. 支持 Direction 字段: direction enable 且 direction≠0 时对力效果乘 sin(角度) (东=+X, 西=-X); direction=0 视为符号在 magnitude 里的游戏, 直通
-20. Set Condition 只接受 parameterBlockOffset==0, 防止 Y 轴条件块覆盖 X 轴弹簧参数
-21. GET_REPORT(Input) 现在会应答 PID State 报告 (部分驱动打开设备时查询)
-22. gain==0 不再被偷换成 255; Create Effect 后默认 gain=255
-
-安全性 (main.c / odrive_can.c):
-
-23. USB 拔线/挂起 (`tud_umount_cb`/`tud_suspend_cb`) 时停止所有效果并清零力矩 — 此前游戏崩溃后无限时长效果会永远输出力矩
-24. 心跳中 `axis_error` 非零时停发力矩指令
-25. ODrive v0.5.x 心跳的 current_state 是单字节 (后随 3 个 flag 字节), 原按 uint32 解析, flag 非零时会误判闭环状态
-26. `odrive_init` 不再阻塞 500ms 等心跳 (正值 USB 枚举窗口); 改为主循环 1 Hz 重发闭环请求, 电机晚上电也能进闭环
-
-CAN 驱动 (mcp2515.c):
-
-27. 启用 One-Shot 模式: 电机断电/无 ACK 时 TXREQ 不再永久挂起 (原来每帧阻塞 50ms, 主循环掉到 20Hz 拖死 USB); TX 等待缩短到 2ms
-28. 接收路径补上 RXB1: 原来开了 BUKT rollover 但从不读 RXB1/清 RX1IF, 首次 rollover 后 RXB1 永久占用
-
-### 2026-07-20 稳定性与掉电恢复
-
-效果引擎 (main.c):
-
-29. Inertia 加速度估计恒为 0: 1kHz 调用时 `dt` 正好 1ms 被 `>0.001f` 挡掉。改为每帧差分 + EMA 低通 (自衰减、无卡值), 惯性效果恢复可用
-
-CAN / USB 稳定性 (mcp2515.c, main.c, CMakeLists.txt):
-
-30. `mcp2515_send` 完全非阻塞: 去掉 2ms 忙等, TXB0 忙则 abort 旧帧 (1kHz 力矩流最新值优先), 永不占用热路径
-31. 整帧 SPI 指令: 用 `LOAD TX BUFFER (0x40)` / `READ RX BUFFER (0x90/0x94)` 一次 CS 收发整帧, SPI 事务从 ~13 次降到 ~2 次; READ RX 靠 CS 拉高自动清 RXnIF
-32. **双核拆分**: CAN (init/poll/arm/torque) 全部移到 core1, USB + FFB 留在 core0。CAN 阻塞不再影响 USB 时序 (根治单核轮询互相拖累); MCP 初始化的 sleep 也不再卡在 USB 枚举窗口
-
-掉电恢复 (odrive_can.c, main.c):
-
-33. 电机离线检测: 心跳/编码器广播静默超过 250ms 即判离线 → 清 `closed_loop`/`encoder_valid`, 力矩门控到 0、1Hz 重发闭环。此前电机运行中掉电, `closed_loop` 会卡在 stale true, 恢复迟滞
-34. 掉电重连自动重设中心: `encoder_valid` false→true 的上升沿重新捕获盘中心。防止增量编码器重启后零点漂移 → 陈旧 offset 让弹簧**猛甩方向盘**
-35. 力矩三条件门控: 仅当 `!axis_error && closed_loop` 才输出力矩, 否则恒 0 (含离线超时窗口)
-
-> ⚠️ 30/31 (整帧 SPI 指令) 与 32-35 尚未实机验证, 请编译后上机确认 CAN 收发与掉电恢复行为。
-
-### 2026-07-20 按钮支持与构建修复
-
-36. **`-D` 调优标志此前完全不生效**: CMakeLists 从未把 `cmake -DMAX_NM=...` 转发给编译器, 只是设了个没人用的 CMake 缓存变量, C 里 `#ifndef` 默认值一直赢。现加 foreach 转发块, README 里所有 `-D` 标志(含 MAX_NM/TORQUE_SIGN/PEDAL_COUNT/BUTTON_CHIPS)才真正可覆盖
-37. 按钮支持: HID 描述符按钮 8→32, 报告结构体 `buttons` uint8→uint32; 新增 `buttons.c` 走 MCP23017 I²C(1-2 片, 16/32 键, 带超时去抖)。默认禁用
-38. 修掉 `PEDAL_COUNT=0` 时 `int16_t ped[0]` 的零长数组告警(数组尺寸取 `max(1, PEDAL_COUNT)`)
-
-⚠️ 待实机核实: `MAX_NM` 的量纲 — Set_Input_Torque 通常是减速箱**之前**的电机侧力矩, 4 Nm × 8:1 意味着盘端最高 ~32 Nm; 而如果手册的 "5 Nm 额定" 是输出侧, 电机侧额定仅 ~0.6 Nm。两种解读必有一错, 上机前先用低值 (如 `-DMAX_NM=0.5`) 验证。
+- HID FFB 描述符源自 **VNWheel**(MIT,Hoan Tran);效果数学参考 **OpenFFBoard**(GPL,Yannick)。
+- VID/PID `0x1209/0xFFB0` 沿用 OpenFFBoard,便于按 ID 注册的游戏(Dirt、EA WRC)免改识别。
+- 兼容任意 DirectInput FFB 游戏:Assetto Corsa、iRacing、rFactor 2、BeamNG、Forza 等。

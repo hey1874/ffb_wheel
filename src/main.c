@@ -5,13 +5,20 @@
  *   - USB:  RP2040 native USB (Full-Speed). Games see VID 0x1209/PID 0xFFB0.
  *   - CAN:  MCP2515 SPI-CAN module (spi0: GP18/19/16/17) → GIM6010-8 motor.
  *   - Motor: SteadyWin GIM6010-8 (ODrive-compatible firmware v0.5.16,
- *           node_id 0, 8:1 gearbox, 5 Nm motor-side rated torque).
+ *           node_id 1 default, 8:1 gearbox).
+ *
+ * Dual-core split (so CAN blocking can never stall USB timing):
+ *   core0 (this file's main): USB (tud_task) + FFB effect engine + input report
+ *          (wheel axis, pedals ADC, buttons I2C). Publishes torque to a shared
+ *          g_torque_cmd; reads the s_odrv encoder/state cache.
+ *   core1 (core1_entry): all MCP2515/SPI/CAN — init, poll (fills s_odrv),
+ *          1 Hz re-arm, and the ~1 kHz torque stream (reads g_torque_cmd).
  *
  * Data flow:
- *   Game ←USB HID FFB→ TinyUSB → ffb.c (effect engine) → ffb_output_torque()
- *     → odrive_set_torque() → MCP2515 → CAN → GIM6010-8
- *   GIM6010-8 → CAN → MCP2515 → odrive_poll() → cached pos/vel
- *     → read_encoder_*() → ffb_calculate() + wheel input report
+ *   Game ←USB HID FFB→ TinyUSB → ffb.c → ffb_output_torque() → g_torque_cmd
+ *     ─(core1)→ odrive_set_torque() → MCP2515 → CAN → GIM6010-8
+ *   GIM6010-8 → CAN → MCP2515 → odrive_poll() (core1) → s_odrv cache
+ *     ─(core0)→ read_encoder_*() → ffb_calculate() + wheel input report
  */
 #include <string.h>
 
@@ -32,15 +39,18 @@
 /* Configuration                                                */
 /* ============================================================ */
 
-/* Motor-side torque (Nm) corresponding to FFB engine's full-scale output
+/* Output-side (wheel-rim) torque in Nm at the FFB engine's full-scale output
  * (±32767). Override with -DMAX_NM=... at build time.
  *
- * SAFETY — verify the unit before raising this. Set_Input_Torque (0x0E) is
- * in the units of the motor's configured torque constant, normally BEFORE
- * the 8:1 gearbox: the rim then sees up to 8 × MAX_NM (minus losses). If
- * the "5 Nm rated" figure on the GIM6010-8 datasheet is the OUTPUT-side
- * rating, the motor-side rating is only ~0.6 Nm and MAX_NM=4.0 overdrives
- * it. Check the manual and measure current before trusting full scale. */
+ * The GIM6010-8's ODrive torque_constant is configured output-referenced, so
+ * Set_Input_Torque (0x0E) is in rim Nm with the 8:1 reduction already folded in
+ * — MAX_NM is sent as-is (no gearbox division here). 4.0 ≈ the actuator's rated
+ * output torque.
+ *
+ * SAFETY: if a given motor's torque_constant were instead motor-referenced,
+ * MAX_NM would be 8× stronger at the rim (4.0 → ~32 Nm, wrist-breaking). Verify
+ * once on first bring-up — command a small torque and check the felt force /
+ * motor current — before trusting full scale. Start low: -DMAX_NM=0.5. */
 #ifndef MAX_NM
 #define MAX_NM  4.0f
 #endif
@@ -61,6 +71,12 @@
 /* Velocity normalization: motor turns/s at which the PID metric hits ±10000.
  * 80 turns/s motor = 10 turns/s output = 3600°/s — faster than any human. */
 #define VEL_NORM_TURNS  80.0f
+
+/* Fail-safe: if core0 (the FFB loop) stops updating its liveness stamp for this
+ * long, core1 treats it as wedged and commands zero torque. Without this the
+ * dual-core split would keep streaming the last torque AND keep feeding the
+ * ODrive watchdog even with a dead FFB loop, leaving the wheel holding force. */
+#define CORE0_STALL_MS  50
 
 /* ---- Polarity (bring-up calibration; each is +1 or -1) ---------------------
  * The motor/encoder wiring fixes two physical facts the firmware can't know:
@@ -127,6 +143,10 @@ uint32_t ffb_get_tick_ms(void) {
  * to memory where core1 will see it. */
 static volatile int16_t g_torque_cmd = 0;
 
+/* Core0 liveness stamp (ms of the last main-loop pass). core1 watches it and
+ * stops commanding torque if it stops advancing — see CORE0_STALL_MS. */
+static volatile uint32_t g_core0_alive_ms = 0;
+
 void ffb_output_torque(int16_t torque) {
     /* Runs on core0. Just publish the command; core1 owns the CAN link and does
      * the Nm/TORQUE_SIGN conversion next to the actual send, so nothing on the
@@ -184,7 +204,10 @@ static int32_t read_encoder_acceleration(void) {
         int32_t a  = (int32_t)(dv * (10000.0f / 800.0f));  /* 800 turns/s² → 10000 */
         if (a >  10000) a =  10000;
         if (a < -10000) a = -10000;
-        s_acc_filt += (a - s_acc_filt) / 8;                /* lowpass, τ≈8 samples */
+        /* lowpass, τ≈8 samples; round the /8 so small residuals aren't
+         * truncated to a steady-state dead band. */
+        int32_t d = a - s_acc_filt;
+        s_acc_filt += (d + (d >= 0 ? 4 : -4)) / 8;
         s_prev_vel      = vel;
         s_prev_vel_tick = now;
     }
@@ -271,11 +294,15 @@ static void core1_entry(void) {
         }
 
         /* Stream the latest torque at ~1 kHz (also feeds the ODrive CAN
-         * watchdog). Map -32767..32767 → ±MAX_NM (motor side); TORQUE_SIGN
-         * corrects physical rotation direction (see polarity notes above). */
+         * watchdog). Map -32767..32767 → ±MAX_NM (rim Nm); TORQUE_SIGN corrects
+         * physical rotation direction (see polarity notes above).
+         * Fail-safe: if core0's FFB loop wedged (stamp stopped advancing), send
+         * zero instead of latching its last torque forever. */
         if (now != last_tx) {
             last_tx = now;
-            float nm = (float)g_torque_cmd * (MAX_NM / 32767.0f) * TORQUE_SIGN;
+            int16_t t = ((uint32_t)(now - g_core0_alive_ms) > CORE0_STALL_MS)
+                        ? 0 : g_torque_cmd;
+            float nm = (float)t * (MAX_NM / 32767.0f) * TORQUE_SIGN;
             odrive_set_torque(ODRIVE_NODE_ID, nm);
         }
     }
@@ -311,6 +338,7 @@ int main(void) {
         tud_task();  /* TinyUSB device task — must be called frequently */
 
         uint32_t now = ffb_get_tick_ms();
+        g_core0_alive_ms = now;   /* liveness stamp for core1's fail-safe */
 
         /* (Re)capture center on every rising edge of "encoder live". This fires
          * at first boot AND whenever the motor returns after a power-cycle —
@@ -328,11 +356,14 @@ int main(void) {
          * publishes torque via ffb_output_torque() → g_torque_cmd (core1 sends). */
         if (now != last_calc) {
             last_calc = now;
-            /* Drive torque only when the motor is armed and healthy. A fault,
-             * or an axis that is not (or no longer) CLOSED_LOOP — including the
-             * offline timeout — commands zero rather than fighting or pushing
-             * against a stale center. */
-            if (odrive_axis_error() != 0 || !odrive_is_closed_loop()) {
+            /* Drive torque only when the motor is armed and healthy AND the
+             * encoder is live. Requiring odrive_has_encoder() closes a narrow
+             * window after a power-cycle where a CLOSED_LOOP heartbeat could
+             * arrive before the first encoder frame re-validates (and thus
+             * re-centers) — otherwise torque could push against a stale center.
+             * A fault / not-CLOSED_LOOP / offline timeout all command zero. */
+            if (odrive_axis_error() != 0 || !odrive_is_closed_loop()
+                || !odrive_has_encoder()) {
                 ffb_output_torque(0);
             } else {
                 ffb_axis_metrics_t m = {

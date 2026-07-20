@@ -19,7 +19,10 @@
 #define MCP_GPIOA   0x12   /* +1 = GPIOB, sequential read auto-increments */
 
 #define BTN_BITS       (16 * BUTTON_CHIPS)
-#define I2C_TIMEOUT_US 1000
+/* Short timeout: a present chip answers in tens of µs; this only bounds the
+ * cost of a stuck bus. Kept small so an unresponsive chip can't add more than
+ * ~0.3 ms per transaction to the core0 input-report pass. */
+#define I2C_TIMEOUT_US 300
 
 static const uint8_t s_addr[BUTTON_CHIPS] = {
     BUTTON_ADDR0,
